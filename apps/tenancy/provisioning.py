@@ -8,9 +8,9 @@ private network (``<app>.internal``), so the front must run in the same org.
 
 The store admits only its own tenant and checks the front's short-lived
 signed tokens against ``STORE_SESSION_VERIFYING_KEYS_HEX``, a public key. Its
-one secret is the bearer token for the tenant's coding environment
-(``apps.tenancy.environment``), which reaches it as a Fly app secret rather
-than in the machine config. When the environment is already serving, the store
+two secrets are the credentials for the tenant's coding environment
+(``apps.tenancy.environment``), which reach it as Fly app secrets rather than
+in the machine config. When the environment is already serving, the store
 is created bound to it; otherwise ``bind_store`` binds it later.
 """
 
@@ -24,7 +24,7 @@ from django.db import transaction
 from apps.tenancy.environment import (
     STORE_MACHINE_NAME,
     bind_store,
-    set_store_token,
+    set_store_tokens,
     store_binding,
     with_binding,
 )
@@ -151,7 +151,7 @@ def provision(
     binding = store_binding(tenant)
     if binding is not None:
         config = with_binding(config, binding)
-        secrets_version = set_store_token(client, app, tenant)
+        secrets_version = set_store_tokens(client, app, tenant)
     machine = client.ensure_machine(
         app,
         name=MACHINE_NAME,

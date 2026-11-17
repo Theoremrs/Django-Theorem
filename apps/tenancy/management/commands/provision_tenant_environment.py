@@ -1,11 +1,11 @@
 """Build a tenant's coding environment now, retry a failed one, or bring a
-serving one up to the pinned host binary.
+serving one up to the pinned sprite bundle.
 
     manage.py provision_tenant_environment <tenant-slug>
 
 Signup runs the same steps in the background. Run this for a tenant created
 before environments were configured, after a ``failed`` run, or after moving
-``ENVIRONMENT_HOST_SHA256`` to a newly published build. When
+``ENVIRONMENT_BUNDLE_SHA256`` to a newly published bundle. When
 the tenant's store serves, it is bound to the environment too.
 """
 

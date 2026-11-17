@@ -47,8 +47,16 @@ class EnvironmentHostAdmin(admin.ModelAdmin):
     """Hosts are read here; provisioning goes through
     ``provision_tenant_environment``, which also binds the tenant's store."""
 
-    list_display = ("tenant", "sprite", "state", "url", "host_sha256", "updated_at")
+    list_display = ("tenant", "sprite", "state", "url", "bundle_sha256", "updated_at")
     list_filter = ("state",)
     search_fields = ("tenant__slug", "sprite")
     raw_id_fields = ("tenant",)
-    readonly_fields = ("tenant", "sprite", "url", "host_sha256", "state", "last_error")
+    readonly_fields = (
+        "tenant",
+        "sprite",
+        "url",
+        "bundle_sha256",
+        "credential_fingerprint",
+        "state",
+        "last_error",
+    )

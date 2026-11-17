@@ -247,14 +247,16 @@ class StorePlacement(models.Model):
 class EnvironmentHost(models.Model):
     """control_environmenthost — the coding environment a tenant works in.
 
-    Each tenant gets one Fly Sprite running ``theorem-ide-host``. The tenant's
-    store reaches it at ``url`` with a bearer token derived from
-    ``ENVIRONMENT_TOKEN_KEY``; the binding travels to the store in its machine
-    config, so Rust does not read this table.
+    Each tenant gets one Fly Sprite running the sprite bundle: the environment
+    host and code mode behind one router. The tenant's store reaches it at
+    ``url`` with two credentials derived from ``ENVIRONMENT_TOKEN_KEY``; the
+    binding travels to the store in its machine config, so Rust does not read
+    this table.
 
     - ``provisioning``: the sprite is being created or brought up to date.
-    - ``serving``: the host answered as this tenant's; ``host_sha256`` is the
-      binary it runs.
+    - ``serving``: the sprite answered as this tenant's; ``bundle_sha256`` is
+      the bundle it runs and ``credential_fingerprint`` names the credentials
+      it accepts, the only ones the store may be bound to.
     - ``failed``: provisioning stopped with ``last_error``; run
       ``manage.py provision_tenant_environment`` to retry.
     """
@@ -270,7 +272,8 @@ class EnvironmentHost(models.Model):
     )
     sprite = models.CharField(max_length=63, unique=True)
     url = models.URLField(max_length=512, blank=True, default="")
-    host_sha256 = models.CharField(max_length=64, blank=True, default="")
+    bundle_sha256 = models.CharField(max_length=64, blank=True, default="")
+    credential_fingerprint = models.CharField(max_length=16, blank=True, default="")
     state = models.CharField(max_length=16, choices=State.choices, default=State.PROVISIONING)
     last_error = models.TextField(blank=True, default="")
     created_at = models.DateTimeField(auto_now_add=True)
@@ -283,17 +286,27 @@ class EnvironmentHost(models.Model):
     def __str__(self) -> str:
         return f"{self.tenant.slug} on sprite {self.sprite}"
 
-    def mark_serving(self, *, url: str, host_sha256: str) -> None:
-        """Record the host as answering for its tenant, new or brought up to date."""
+    def mark_serving(self, *, url: str, bundle_sha256: str, credential_fingerprint: str) -> None:
+        """Record the sprite as answering for its tenant, new or brought up to date."""
         with transaction.atomic():
             locked = self._locked()
             if locked.state == self.State.FAILED:
                 raise PlacementTransitionError(f"{locked} failed; retry it first")
             locked.state = self.State.SERVING
             locked.url = url
-            locked.host_sha256 = host_sha256
+            locked.bundle_sha256 = bundle_sha256
+            locked.credential_fingerprint = credential_fingerprint
             locked.last_error = ""
-            locked.save(update_fields=["state", "url", "host_sha256", "last_error", "updated_at"])
+            locked.save(
+                update_fields=[
+                    "state",
+                    "url",
+                    "bundle_sha256",
+                    "credential_fingerprint",
+                    "last_error",
+                    "updated_at",
+                ]
+            )
         self.refresh_from_db()
 
     def mark_failed(self, error: str) -> None:
