@@ -186,6 +186,15 @@ STORE_CPUS = env.int("STORE_CPUS", default=2)
 STORE_MEMORY_MB = env.int("STORE_MEMORY_MB", default=4096)
 STORE_VOLUME_GB = env.int("STORE_VOLUME_GB", default=10)
 STORE_PROVISION_TIMEOUT_SECONDS = env.int("STORE_PROVISION_TIMEOUT_SECONDS", default=600)
+# A placement left in provisioning this long with no attempt touching it lost
+# its build job (a broker outage at signup, a worker killed mid-run); the sweep
+# queues it again. Longer than one attempt plus the longest retry backoff.
+STORE_PROVISION_STRANDED_AFTER_SECONDS = env.int(
+    "STORE_PROVISION_STRANDED_AFTER_SECONDS", default=30 * 60
+)
+STORE_PROVISION_SWEEP_INTERVAL_SECONDS = env.int(
+    "STORE_PROVISION_SWEEP_INTERVAL_SECONDS", default=5 * 60
+)
 
 # Coding environments (apps.tenancy.environment). Signup also gives each
 # tenant one Fly Sprite running the sprite bundle (the environment host and
@@ -272,6 +281,10 @@ CELERY_BEAT_SCHEDULE = {
     "extraction-reconciliation": {
         "task": "apps.extraction.tasks.sweep_extraction_jobs",
         "schedule": EXTRACTION_SWEEP_INTERVAL_SECONDS,
+    },
+    "stranded-store-provisioning": {
+        "task": "apps.tenancy.tasks.sweep_stranded_store_provisioning",
+        "schedule": STORE_PROVISION_SWEEP_INTERVAL_SECONDS,
     },
 }
 # R queue note: workers consuming `offload.r` must pin R + renv; agent name is "R".

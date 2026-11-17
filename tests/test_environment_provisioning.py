@@ -287,6 +287,19 @@ def test_signup_records_the_sprite_and_enqueues_both_builds(
     assert sorted(queued) == [("environment", str(tenant.pk)), ("store", str(tenant.pk))]
 
 
+def test_a_broker_outage_does_not_fail_signup_through_the_environment(
+    both_configured, django_capture_on_commit_callbacks, monkeypatch
+):
+    def refuse(tenant_id):
+        raise ConnectionError("broker down")
+
+    monkeypatch.setattr("apps.tenancy.tasks.provision_tenant_store.delay", lambda t: None)
+    monkeypatch.setattr("apps.tenancy.tasks.provision_tenant_environment.delay", refuse)
+    with django_capture_on_commit_callbacks(execute=True):
+        tenant = _tenant()
+    assert EnvironmentHost.objects.get(tenant=tenant).state == EnvironmentHost.State.PROVISIONING
+
+
 def test_provision_builds_a_public_sprite_running_the_bundle(env_configured):
     tenant = _tenant()
     sprites = FakeSprites()
@@ -525,7 +538,7 @@ def test_task_records_failure(env_configured, monkeypatch):
 
 
 def _serving_store(tenant: Tenant, fly: FakeFly) -> StorePlacement:
-    return provision(StorePlacement.objects.get(tenant=tenant), fly.client(), poll_interval_seconds=0)
+    return provision(StorePlacement.objects.get(tenant=tenant), fly.client(), claimant="attempt", poll_interval_seconds=0)
 
 
 def _bound_hosts(config: dict) -> dict:

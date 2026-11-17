@@ -16,6 +16,7 @@ is created bound to it; otherwise ``bind_store`` binds it later.
 
 from __future__ import annotations
 
+from datetime import timedelta
 from time import monotonic, sleep
 
 from django.conf import settings
@@ -39,6 +40,10 @@ READY_CHECK = "store_ready"
 
 class ProvisioningError(RuntimeError):
     """The store could not be built; the placement records why."""
+
+
+class BuildClaimed(RuntimeError):
+    """Another attempt is building this placement's store; this one stood down."""
 
 
 def provisioning_configured() -> bool:
@@ -75,13 +80,14 @@ def begin_provisioning(tenant: Tenant) -> StorePlacement:
         )
 
 
-def machine_config(tenant: Tenant, app: str) -> dict:
+def machine_config(tenant: Tenant, app: str, volume_id: str) -> dict:
     memory_mb = settings.STORE_MEMORY_MB
     memory_bytes = memory_mb * 1024 * 1024
     return {
         "image": settings.STORE_IMAGE,
         "guest": {"cpu_kind": "shared", "cpus": settings.STORE_CPUS, "memory_mb": memory_mb},
-        "mounts": [{"volume": VOLUME_NAME, "path": "/data"}],
+        # Fly mounts a volume by its id, not its name.
+        "mounts": [{"volume": volume_id, "path": "/data"}],
         "restart": {"policy": "always"},
         "metadata": {"theorem_tenant": tenant.slug, "theorem_role": "store"},
         "env": {
@@ -125,29 +131,44 @@ def provision(
     placement: StorePlacement,
     client: FlyMachinesClient,
     *,
+    claimant: str,
     poll_interval_seconds: float = 5.0,
 ) -> StorePlacement:
     """Build the placement's store and serve the tenant from it.
 
-    Safe to run again after a crash or a failure: each Fly resource is found by
-    name before it is created. Raises ``FlyApiError`` for a failure worth
-    retrying and ``ProvisioningError`` when the store never became ready.
+    ``claimant`` names this attempt; a retry of the same attempt passes the same
+    name. Safe to run again after a crash or a failure: each Fly resource is
+    found by name before it is created. Raises ``BuildClaimed`` when another
+    attempt holds the build, ``FlyApiError`` for a failure worth retrying, and
+    ``ProvisioningError`` when the store never became ready. A ``serving`` or
+    ``failed`` placement is returned as it is: an operator retries a failed
+    build (``manage.py provision_tenant_store``).
     """
     placement = StorePlacement.objects.select_related("tenant", "store").get(pk=placement.pk)
     if placement.state == StorePlacement.State.SERVING:
         bind_store(placement.tenant, client)
         return placement
     if placement.state == StorePlacement.State.FAILED:
-        placement.retry_provisioning()
+        return placement
     if placement.state != StorePlacement.State.PROVISIONING:
         raise ProvisioningError(f"{placement} is {placement.state}, not provisioning")
+    # Longer than one attempt plus its retry backoff, so a live attempt keeps
+    # the build; a dead one's claim lapses and the sweep queues a new attempt.
+    hold = timedelta(seconds=settings.STORE_PROVISION_STRANDED_AFTER_SECONDS)
+    if not placement.claim_build(claimant, hold):
+        raise BuildClaimed(f"another attempt is building {placement}")
 
     tenant, store = placement.tenant, placement.store
     app = store.fly_app or store.slug
     region = settings.STORE_REGION
     client.ensure_app(app)
-    client.ensure_volume(app, name=VOLUME_NAME, region=region, size_gb=settings.STORE_VOLUME_GB)
-    config, secrets_version = machine_config(tenant, app), None
+    volume = client.ensure_volume(
+        app, name=VOLUME_NAME, region=region, size_gb=settings.STORE_VOLUME_GB
+    )
+    volume_id = volume.get("id")
+    if not volume_id:
+        raise FlyApiError(f"Fly returned no volume id for {app}")
+    config, secrets_version = machine_config(tenant, app, volume_id), None
     binding = store_binding(tenant)
     if binding is not None:
         config = with_binding(config, binding)

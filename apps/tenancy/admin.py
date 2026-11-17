@@ -34,13 +34,19 @@ class StorePlacementAdmin(admin.ModelAdmin):
     list_filter = ("state", "store")
     search_fields = ("tenant__slug", "store__slug")
     raw_id_fields = ("tenant",)
-    readonly_fields = ("state", "target_store", "epoch", "last_error")
+    readonly_fields = (
+        "state", "target_store", "epoch", "last_error", "build_claimant", "build_claimed_until",
+    )
 
     def get_readonly_fields(self, request, obj=None):
         if obj is None:
             return self.readonly_fields
         return ("tenant", "store", *self.readonly_fields)
 
+    def has_delete_permission(self, request, obj=None):
+        # Deleting a placement and making a new one would skip the checked
+        # move steps and reset the epoch; deleting alone strands the tenant.
+        return False
 
 @admin.register(EnvironmentHost)
 class EnvironmentHostAdmin(admin.ModelAdmin):

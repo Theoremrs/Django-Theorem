@@ -144,7 +144,7 @@ def test_provision_builds_the_store_in_the_theorem_org_and_serves_the_tenant(con
     with transaction.atomic():
         tenant = _tenant()  # the signal already began provisioning
     fly = FakeFly(ready_after=3)
-    placement = provision(StorePlacement.objects.get(tenant=tenant), fly.client(), poll_interval_seconds=0)
+    placement = provision(StorePlacement.objects.get(tenant=tenant), fly.client(), claimant="attempt", poll_interval_seconds=0)
 
     app = store_app_name(tenant)
     assert placement.state == StorePlacement.State.SERVING
@@ -157,7 +157,9 @@ def test_provision_builds_the_store_in_the_theorem_org_and_serves_the_tenant(con
     machine = fly.machines[app][0]
     env = machine["config"]["env"]
     assert machine["config"]["image"] == configured.STORE_IMAGE
-    assert machine["config"]["mounts"] == [{"volume": "rustyred_data", "path": "/data"}]
+    # Fly mounts by volume id; the name is only how a retry finds the volume.
+    assert machine["config"]["mounts"] == [{"volume": fly.volumes[app][0]["id"], "path": "/data"}]
+    assert fly.volumes[app][0]["id"] != "rustyred_data"
     assert env["RUSTY_RED_TENANT_ALLOWLIST"] == tenant.slug
     assert env["RUSTY_RED_TENANT_ADMISSION"] == "allowlist"
     assert env["RUSTY_RED_REQUIRE_AUTH"] == "true"
@@ -168,7 +170,7 @@ def test_provision_builds_the_store_in_the_theorem_org_and_serves_the_tenant(con
 def test_the_store_machine_carries_no_credential(configured):
     tenant = _tenant()
     fly = FakeFly()
-    provision(StorePlacement.objects.get(tenant=tenant), fly.client(), poll_interval_seconds=0)
+    provision(StorePlacement.objects.get(tenant=tenant), fly.client(), claimant="attempt", poll_interval_seconds=0)
     config = fly.machines[store_app_name(tenant)][0]["config"]
     rendered = json.dumps(config)
     assert "fly-test-token" not in rendered
@@ -183,10 +185,10 @@ def test_a_retried_run_reuses_what_the_first_attempt_made(configured):
     fly = FakeFly(fail_machine_create=1)
     placement = StorePlacement.objects.get(tenant=tenant)
     with pytest.raises(FlyApiError):
-        provision(placement, fly.client(), poll_interval_seconds=0)
+        provision(placement, fly.client(), claimant="attempt", poll_interval_seconds=0)
     assert StorePlacement.objects.get(tenant=tenant).state == StorePlacement.State.PROVISIONING
 
-    provision(placement, fly.client(), poll_interval_seconds=0)
+    provision(placement, fly.client(), claimant="attempt", poll_interval_seconds=0)
     app = store_app_name(tenant)
     assert len(fly.apps) == 1
     assert len(fly.volumes[app]) == 1
@@ -200,7 +202,7 @@ def test_a_store_that_never_becomes_ready_is_refused(configured):
     tenant = _tenant()
     fly = FakeFly(ready_after=10_000)
     with pytest.raises(ProvisioningError):
-        provision(StorePlacement.objects.get(tenant=tenant), fly.client(), poll_interval_seconds=0)
+        provision(StorePlacement.objects.get(tenant=tenant), fly.client(), claimant="attempt", poll_interval_seconds=0)
 
 
 def test_a_fly_app_in_another_org_is_refused(configured):
@@ -209,7 +211,7 @@ def test_a_fly_app_in_another_org_is_refused(configured):
     app = store_app_name(tenant)
     fly.apps[app] = {"name": app, "organization": {"slug": "personal"}}
     with pytest.raises(FlyApiError, match="belongs to personal"):
-        provision(StorePlacement.objects.get(tenant=tenant), fly.client(), poll_interval_seconds=0)
+        provision(StorePlacement.objects.get(tenant=tenant), fly.client(), claimant="attempt", poll_interval_seconds=0)
 
 
 def test_task_records_failure_when_retries_run_out(configured, monkeypatch):
@@ -262,6 +264,143 @@ def test_a_provisioning_placement_cannot_be_moved_or_aborted(configured):
         placement.abort_move()
     with pytest.raises(PlacementTransitionError):
         placement.retry_provisioning()
+
+
+def test_a_broker_outage_does_not_fail_signup(configured, django_capture_on_commit_callbacks, monkeypatch):
+    def refuse(tenant_id):
+        raise ConnectionError("broker down")
+
+    monkeypatch.setattr("apps.tenancy.tasks.provision_tenant_store.delay", refuse)
+    with django_capture_on_commit_callbacks(execute=True):
+        tenant = _tenant()
+    assert StorePlacement.objects.get(tenant=tenant).state == StorePlacement.State.PROVISIONING
+
+
+def test_the_sweep_queues_only_stranded_builds(configured, monkeypatch):
+    from datetime import timedelta
+
+    from django.utils import timezone
+
+    from apps.tenancy import tasks
+
+    queued: list[str] = []
+    monkeypatch.setattr(tasks.provision_tenant_store, "delay", lambda tenant_id: queued.append(tenant_id))
+    stale = timezone.now() - timedelta(seconds=configured.STORE_PROVISION_STRANDED_AFTER_SECONDS + 60)
+    stranded, fresh, failed = _tenant(), _tenant(), _tenant()
+    StorePlacement.objects.filter(tenant__in=[stranded, failed]).update(updated_at=stale)
+    StorePlacement.objects.get(tenant=failed).mark_failed("capacity")
+    StorePlacement.objects.filter(tenant=failed).update(updated_at=stale)
+
+    assert tasks.sweep_stranded_store_provisioning() == 1
+    assert queued == [str(stranded.pk)]
+    # The serving personal tenant, the fresh build and the failed one are left alone.
+    assert str(fresh.pk) not in queued and str(failed.pk) not in queued
+    # Queuing touches the placement, so the next sweep does not queue it twice.
+    assert tasks.sweep_stranded_store_provisioning() == 0
+    assert queued == [str(stranded.pk)]
+
+
+def test_the_sweep_does_nothing_without_configuration(settings, monkeypatch):
+    from apps.tenancy import tasks
+
+    settings.FLY_API_TOKEN = ""
+    monkeypatch.setattr(tasks.provision_tenant_store, "delay", lambda tenant_id: pytest.fail("queued"))
+    assert tasks.sweep_stranded_store_provisioning() == 0
+
+
+def test_an_attempt_claims_and_touches_its_placement(configured, monkeypatch):
+    from datetime import timedelta
+
+    from django.utils import timezone
+
+    tenant = _tenant()
+    stale = timezone.now() - timedelta(days=1)
+    StorePlacement.objects.filter(tenant=tenant).update(updated_at=stale)
+    placement = StorePlacement.objects.get(tenant=tenant)
+    assert placement.claim_build("attempt", timedelta(minutes=30))
+    placement.refresh_from_db()
+    assert placement.updated_at > stale
+    assert placement.build_claimant == "attempt"
+
+
+def test_a_second_job_stands_down_while_the_first_holds_the_build(configured, monkeypatch):
+    from datetime import timedelta
+
+    from apps.tenancy import tasks
+
+    tenant = _tenant()
+    placement = StorePlacement.objects.get(tenant=tenant)
+    assert placement.claim_build("task:first", timedelta(minutes=30))
+    fly = FakeFly()
+    monkeypatch.setattr(tasks, "client_from_settings", fly.client)
+
+    result = tasks.provision_tenant_store.apply(args=[str(tenant.pk)]).get()
+    assert result["state"] == "claimed"
+    assert fly.calls == []
+    assert StorePlacement.objects.get(tenant=tenant).state == StorePlacement.State.PROVISIONING
+
+    # The holder itself, retried under the same name, still builds and serves.
+    provision(placement, fly.client(), claimant="task:first", poll_interval_seconds=0)
+    placement.refresh_from_db()
+    assert placement.state == StorePlacement.State.SERVING
+    assert placement.build_claimant == "" and placement.build_claimed_until is None
+
+
+def test_a_lapsed_claim_can_be_taken(configured):
+    from datetime import timedelta
+
+    tenant = _tenant()
+    placement = StorePlacement.objects.get(tenant=tenant)
+    assert placement.claim_build("dead", timedelta(minutes=30))
+    assert not placement.claim_build("other", timedelta(minutes=30))
+    assert placement.claim_build("dead", timedelta(minutes=30))  # the holder may renew
+    placement.refresh_from_db()
+    StorePlacement.objects.filter(pk=placement.pk).update(
+        build_claimed_until=placement.build_claimed_until - timedelta(hours=1)
+    )
+    assert placement.claim_build("other", timedelta(minutes=30))
+
+
+def test_a_claim_needs_a_provisioning_placement(configured):
+    from datetime import timedelta
+
+    placement = StorePlacement.objects.get(tenant__slug="Travis-Gilbert")
+    assert placement.state == StorePlacement.State.SERVING
+    assert not placement.claim_build("attempt", timedelta(minutes=30))
+
+
+def test_the_sweep_leaves_a_live_claim_alone(configured, monkeypatch):
+    from datetime import timedelta
+
+    from django.utils import timezone
+
+    from apps.tenancy import tasks
+
+    queued: list[str] = []
+    monkeypatch.setattr(tasks.provision_tenant_store, "delay", lambda tenant_id: queued.append(tenant_id))
+    held, lapsed = _tenant(), _tenant()
+    now = timezone.now()
+    stale = now - timedelta(seconds=configured.STORE_PROVISION_STRANDED_AFTER_SECONDS + 60)
+    StorePlacement.objects.filter(tenant=held).update(
+        updated_at=stale, build_claimant="task:slow", build_claimed_until=now + timedelta(minutes=5)
+    )
+    StorePlacement.objects.filter(tenant=lapsed).update(
+        updated_at=stale, build_claimant="task:dead", build_claimed_until=now - timedelta(minutes=5)
+    )
+    assert tasks.sweep_stranded_store_provisioning() == 1
+    assert queued == [str(lapsed.pk)]
+
+
+def test_the_admin_cannot_delete_a_placement(rf, admin_user):
+    from django.contrib.admin.sites import site
+
+    model_admin = site._registry[StorePlacement]
+    request = rf.get("/")
+    request.user = admin_user
+    placement = StorePlacement.objects.get(tenant__slug="Travis-Gilbert")
+    assert model_admin.has_delete_permission(request, placement) is False
+    # The positive control: the admin still lets the same user view it.
+    assert model_admin.has_view_permission(request, placement) is True
 
 
 def test_a_provisioning_placement_has_no_target(configured):
