@@ -114,14 +114,10 @@ class FakeSprite:
 
     def create_service(self, name: str, **definition) -> ServiceStream:
         assert name in SERVICES
-        self.services[name] = {
-            "args": [],
-            "needs": [],
-            "http_port": None,
-            "env": {},
-            "dir": None,
-            **definition,
-        }
+        self.services[name] = {"http_port": None, "env": {}, "dir": None, **definition}
+        # The Sprites API answers an empty args or needs list with null.
+        for key in ("args", "needs"):
+            self.services[name][key] = definition.get(key) or None
         self.definitions += 1
         return ServiceStream([])
 
@@ -143,7 +139,7 @@ class FakeSprite:
         if name in self.fail_start:
             self.fail_start.discard(name)
             raise APIError(f"{name} exited during start", status_code=500)
-        for need in self.services[name]["needs"]:
+        for need in self.services[name]["needs"] or []:
             assert self.status.get(need) == "running", f"{name} started before {need}"
         self.status[name] = "running"
         self.running[name] = self.bundle_sha
