@@ -277,3 +277,97 @@ class StorePlacement(models.Model):
             .select_related("tenant", "store", "target_store")
             .get(pk=self.pk)
         )
+
+
+class EnvironmentHost(models.Model):
+    """control_environmenthost — the coding environment a tenant works in.
+
+    Each tenant gets one Fly Sprite running the sprite bundle: the environment
+    host and code mode behind one router. The tenant's store reaches it at
+    ``url`` with two credentials derived from ``ENVIRONMENT_TOKEN_KEY``; the
+    binding travels to the store in its machine config, so Rust does not read
+    this table.
+
+    - ``provisioning``: the sprite is being created or brought up to date.
+    - ``serving``: the sprite answered as this tenant's; ``bundle_sha256`` is
+      the bundle it runs and ``credential_fingerprint`` names the credentials
+      it accepts, the only ones the store may be bound to.
+    - ``failed``: provisioning stopped with ``last_error``; run
+      ``manage.py provision_tenant_environment`` to retry.
+    """
+
+    class State(models.TextChoices):
+        PROVISIONING = "provisioning", "Provisioning"
+        SERVING = "serving", "Serving"
+        FAILED = "failed", "Provisioning failed"
+
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    tenant = models.OneToOneField(
+        Tenant, on_delete=models.CASCADE, related_name="environment_host", db_column="tenant_id"
+    )
+    sprite = models.CharField(max_length=63, unique=True)
+    url = models.URLField(max_length=512, blank=True, default="")
+    bundle_sha256 = models.CharField(max_length=64, blank=True, default="")
+    credential_fingerprint = models.CharField(max_length=16, blank=True, default="")
+    state = models.CharField(max_length=16, choices=State.choices, default=State.PROVISIONING)
+    last_error = models.TextField(blank=True, default="")
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        db_table = "control_environmenthost"
+        ordering = ["tenant__slug"]
+
+    def __str__(self) -> str:
+        return f"{self.tenant.slug} on sprite {self.sprite}"
+
+    def mark_serving(self, *, url: str, bundle_sha256: str, credential_fingerprint: str) -> None:
+        """Record the sprite as answering for its tenant, new or brought up to date."""
+        with transaction.atomic():
+            locked = self._locked()
+            if locked.state == self.State.FAILED:
+                raise PlacementTransitionError(f"{locked} failed; retry it first")
+            locked.state = self.State.SERVING
+            locked.url = url
+            locked.bundle_sha256 = bundle_sha256
+            locked.credential_fingerprint = credential_fingerprint
+            locked.last_error = ""
+            locked.save(
+                update_fields=[
+                    "state",
+                    "url",
+                    "bundle_sha256",
+                    "credential_fingerprint",
+                    "last_error",
+                    "updated_at",
+                ]
+            )
+        self.refresh_from_db()
+
+    def mark_failed(self, error: str) -> None:
+        """Stop provisioning and keep the reason for the operator."""
+        with transaction.atomic():
+            locked = self._locked()
+            if locked.state != self.State.PROVISIONING:
+                raise PlacementTransitionError(f"{locked} is not provisioning")
+            locked.state = self.State.FAILED
+            locked.last_error = error
+            locked.save(update_fields=["state", "last_error", "updated_at"])
+        self.refresh_from_db()
+
+    def retry(self) -> None:
+        """Send a failed host back to the provisioner."""
+        with transaction.atomic():
+            locked = self._locked()
+            if locked.state != self.State.FAILED:
+                raise PlacementTransitionError(f"{locked} must be failed, not {locked.state}")
+            locked.state = self.State.PROVISIONING
+            locked.save(update_fields=["state", "updated_at"])
+        self.refresh_from_db()
+
+    def _locked(self) -> "EnvironmentHost":
+        return (
+            EnvironmentHost.objects.select_for_update(of=("self",))
+            .select_related("tenant")
+            .get(pk=self.pk)
+        )

@@ -6,9 +6,12 @@ and machine in the Theorem org, waits for the store's readiness check, and
 moves the placement to ``serving``. The front routes to the store over Fly's
 private network (``<app>.internal``), so the front must run in the same org.
 
-The store holds no secret. It admits only its own tenant and checks the
-front's short-lived signed tokens against ``STORE_SESSION_VERIFYING_KEYS_HEX``,
-a public key. The only credential here is ``FLY_API_TOKEN``, held by Django.
+The store admits only its own tenant and checks the front's short-lived
+signed tokens against ``STORE_SESSION_VERIFYING_KEYS_HEX``, a public key. Its
+two secrets are the credentials for the tenant's coding environment
+(``apps.tenancy.environment``), which reach it as Fly app secrets rather than
+in the machine config. When the environment is already serving, the store
+is created bound to it; otherwise ``bind_store`` binds it later.
 """
 
 from __future__ import annotations
@@ -19,12 +22,19 @@ from time import monotonic, sleep
 from django.conf import settings
 from django.db import transaction
 
+from apps.tenancy.environment import (
+    STORE_MACHINE_NAME,
+    bind_store,
+    set_store_tokens,
+    store_binding,
+    with_binding,
+)
 from apps.tenancy.fly import FlyApiError, FlyMachinesClient
 from apps.tenancy.models import Store, StorePlacement, Tenant
 
 STORE_PORT = 8380
 VOLUME_NAME = "rustyred_data"
-MACHINE_NAME = "store"
+MACHINE_NAME = STORE_MACHINE_NAME
 READY_CHECK = "store_ready"
 
 
@@ -135,7 +145,10 @@ def provision(
     build (``manage.py provision_tenant_store``).
     """
     placement = StorePlacement.objects.select_related("tenant", "store").get(pk=placement.pk)
-    if placement.state in (StorePlacement.State.SERVING, StorePlacement.State.FAILED):
+    if placement.state == StorePlacement.State.SERVING:
+        bind_store(placement.tenant, client)
+        return placement
+    if placement.state == StorePlacement.State.FAILED:
         return placement
     if placement.state != StorePlacement.State.PROVISIONING:
         raise ProvisioningError(f"{placement} is {placement.state}, not provisioning")
@@ -155,8 +168,17 @@ def provision(
     volume_id = volume.get("id")
     if not volume_id:
         raise FlyApiError(f"Fly returned no volume id for {app}")
+    config, secrets_version = machine_config(tenant, app, volume_id), None
+    binding = store_binding(tenant)
+    if binding is not None:
+        config = with_binding(config, binding)
+        secrets_version = set_store_tokens(client, app, tenant)
     machine = client.ensure_machine(
-        app, name=MACHINE_NAME, region=region, config=machine_config(tenant, app, volume_id)
+        app,
+        name=MACHINE_NAME,
+        region=region,
+        config=config,
+        min_secrets_version=secrets_version,
     )
     machine_id = machine.get("id")
     if not machine_id:
@@ -176,6 +198,8 @@ def provision(
         sleep(poll_interval_seconds)
 
     placement.mark_provisioned()
+    # The environment may have started serving while the store was building.
+    bind_store(tenant, client)
     return placement
 
 

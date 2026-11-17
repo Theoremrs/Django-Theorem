@@ -1,4 +1,4 @@
-"""Start building a store for every tenant signup creates."""
+"""Start building a store and a coding environment for every tenant signup creates."""
 
 from __future__ import annotations
 
@@ -8,6 +8,7 @@ from django.db import transaction
 from django.db.models.signals import post_save
 from django.dispatch import receiver
 
+from apps.tenancy.environment import begin_environment, environment_configured, missing_settings
 from apps.tenancy.models import Tenant
 from apps.tenancy.provisioning import begin_provisioning, provisioning_configured
 
@@ -33,3 +34,26 @@ def provision_store_on_signup(sender, instance: Tenant, created: bool, raw: bool
     # robust: a broker outage must not fail signup. The placement row already
     # records the pending build, and the stranded-provisioning sweep queues it.
     transaction.on_commit(lambda: provision_tenant_store.delay(tenant_id), robust=True)
+
+
+@receiver(post_save, sender=Tenant, dispatch_uid="tenancy.provision_environment_on_signup")
+def provision_environment_on_signup(
+    sender, instance: Tenant, created: bool, raw: bool = False, **kwargs
+):
+    if not created or raw:
+        return
+    if not environment_configured():
+        logger.warning(
+            "tenant %s has no coding environment: set %s to provision one",
+            instance.slug,
+            ", ".join(missing_settings()),
+        )
+        return
+    begin_environment(instance)
+
+    from apps.tenancy.tasks import provision_tenant_environment
+
+    tenant_id = str(instance.pk)
+    # robust, as the store's: a broker outage must not fail signup. The host stays
+    # provisioning, and provision_tenant_environment retries it.
+    transaction.on_commit(lambda: provision_tenant_environment.delay(tenant_id), robust=True)
