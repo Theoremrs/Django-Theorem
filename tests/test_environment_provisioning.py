@@ -115,9 +115,10 @@ class FakeSprite:
     def create_service(self, name: str, **definition) -> ServiceStream:
         assert name in SERVICES
         self.services[name] = {"http_port": None, "env": {}, "dir": None, **definition}
-        # The Sprites API answers an empty args or needs list with null.
-        for key in ("args", "needs"):
-            self.services[name][key] = definition.get(key) or None
+        # The Sprites API answers an empty args or needs list with null, and
+        # sorts needs.
+        self.services[name]["args"] = definition.get("args") or None
+        self.services[name]["needs"] = sorted(definition.get("needs") or []) or None
         self.definitions += 1
         return ServiceStream([])
 
@@ -315,7 +316,7 @@ def test_provision_builds_a_public_sprite_running_the_bundle(env_configured):
     assert codemode["env"]["THEOREM_CODEMODE_TOKEN_FILE"] == CODEMODE_TOKEN_PATH
     assert router["cmd"] == f"{THEOREM_ROOT}/current/run/router"
     assert router["http_port"] == 8080
-    assert router["needs"] == ["ide-host", "codemode"]
+    assert set(router["needs"]) == {"ide-host", "codemode"}
     assert sprite.running == {name: BUNDLE_SHA for name in SERVICES}
 
     assert host.state == EnvironmentHost.State.SERVING

@@ -479,14 +479,14 @@ def _started_record(tenant: Tenant) -> str:
     return hashlib.sha256(json.dumps(material, sort_keys=True).encode()).hexdigest()
 
 
-def _defined(service) -> dict | None:
-    """A service as Sprites reports it, in ``_service_definitions``' shape.
+def _differs(service, desired: dict) -> bool:
+    """Whether Sprites holds a definition other than ``desired``.
 
-    Sprites answers an empty args or needs list with null.
+    Sprites answers an empty args or needs list with null, and sorts needs.
     """
     if service is None:
-        return None
-    return {
+        return True
+    reported = {
         "cmd": service.cmd,
         "args": service.args or [],
         "needs": service.needs or [],
@@ -494,6 +494,7 @@ def _defined(service) -> dict | None:
         "dir": service.dir,
         "env": service.env,
     }
+    return reported != {**desired, "needs": sorted(desired["needs"])}
 
 
 def _service(sprite, name: str):
@@ -529,7 +530,7 @@ def _ensure_services(sprite, tenant: Tenant) -> None:
     restart = _read(sprite, STARTED_PATH) != record
     definitions = _service_definitions(tenant)
     for name, desired in definitions.items():
-        if _defined(_service(sprite, name)) != desired:
+        if _differs(_service(sprite, name), desired):
             sprite.create_service(name, **desired).close()
     if restart:
         for name in reversed(definitions):
