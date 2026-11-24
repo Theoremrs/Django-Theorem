@@ -113,7 +113,13 @@ DEFAULT_AUTO_FIELD = "django.db.models.BigAutoField"
 # ---------------------------------------------------------------------------
 WORKOS_API_KEY = env("WORKOS_API_KEY", default="")
 WORKOS_CLIENT_ID = env("WORKOS_CLIENT_ID", default="")
-WORKOS_WEBHOOK_SECRET = env("WORKOS_WEBHOOK_SECRET", default="test-webhook-secret")
+# No default: without the secret every webhook delivery is refused.
+WORKOS_WEBHOOK_SECRET = env("WORKOS_WEBHOOK_SECRET", default="")
+WORKOS_EVENTS_SYNC_INTERVAL_SECONDS = env.int("WORKOS_EVENTS_SYNC_INTERVAL_SECONDS", default=60)
+# The tenant that existed before WorkOS. The sync waits until bind_workos_owner
+# has given it its organization, so the owner never gets a second tenant.
+# Empty turns the wait off.
+WORKOS_OWNER_TENANT_SLUG = env("WORKOS_OWNER_TENANT_SLUG", default="Travis-Gilbert")
 
 STRIPE_API_KEY = env("STRIPE_API_KEY", default="")
 STRIPE_WEBHOOK_SECRET = env("STRIPE_WEBHOOK_SECRET", default="")
@@ -226,6 +232,13 @@ ENVIRONMENT_READY_TIMEOUT_SECONDS = env.int("ENVIRONMENT_READY_TIMEOUT_SECONDS",
 # Empty VALKEY_URL/REDIS_URL → tenant_cache uses in-memory dict (tests / no Redis).
 VALKEY_URL = env("VALKEY_URL", default=env("REDIS_URL", default=""))
 REDIS_URL = VALKEY_URL
+# The Valkey the Rust front reads control:org:* and control:user:* from; not
+# Django's own VALKEY_URL (broker and caches). Empty keeps the mapping in process
+# memory, which only tests and laptops want.
+FRONT_VALKEY_URL = env("FRONT_VALKEY_URL", default="")
+CONTROL_MAPPING_REWARM_INTERVAL_SECONDS = env.int(
+    "CONTROL_MAPPING_REWARM_INTERVAL_SECONDS", default=10 * 60
+)
 LAYOUT_CACHE_TTL_SECONDS = env.int("LAYOUT_CACHE_TTL_SECONDS", default=24 * 60 * 60)
 LAYOUT_MEMORY_CACHE_MAX_ENTRIES = env.int(
     "LAYOUT_MEMORY_CACHE_MAX_ENTRIES", default=1024
@@ -285,6 +298,14 @@ CELERY_BEAT_SCHEDULE = {
     "stranded-store-provisioning": {
         "task": "apps.tenancy.tasks.sweep_stranded_store_provisioning",
         "schedule": STORE_PROVISION_SWEEP_INTERVAL_SECONDS,
+    },
+    "workos-events-sync": {
+        "task": "apps.identity.tasks.sync_workos_events",
+        "schedule": WORKOS_EVENTS_SYNC_INTERVAL_SECONDS,
+    },
+    "control-mapping-rewarm": {
+        "task": "apps.identity.tasks.rewarm_control_mapping",
+        "schedule": CONTROL_MAPPING_REWARM_INTERVAL_SECONDS,
     },
 }
 # R queue note: workers consuming `offload.r` must pin R + renv; agent name is "R".
