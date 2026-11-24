@@ -75,9 +75,13 @@ preflight as the Fly R worker before starting Celery.
 | `ARTIFACT_S3_SECRET_ACCESS_KEY` | Neon Object Storage secret key (Fly secret) |
 | `ARTIFACT_S3_REGION` | Neon Object Storage region (Fly secret) |
 | `ARTIFACT_S3_BUCKET` | Private Neon Object Storage bucket for Arrow artifacts |
-| `WORKOS_API_KEY` | WorkOS API (live AuthKit; optional for stubs) |
+| `WORKOS_API_KEY` | WorkOS API key. Empty turns the account sync off |
 | `WORKOS_CLIENT_ID` | WorkOS client id |
-| `WORKOS_WEBHOOK_SECRET` | HMAC secret for `POST /webhooks/workos` |
+| `WORKOS_WEBHOOK_SECRET` | WorkOS webhook endpoint secret. No default: empty refuses every delivery (503) |
+| `WORKOS_EVENTS_SYNC_INTERVAL_SECONDS` | Beat interval of the WorkOS Events API sync (default 60) |
+| `WORKOS_OWNER_TENANT_SLUG` | Tenant the sync waits on until `bind_workos_owner` binds it (default `Travis-Gilbert`; empty turns the wait off) |
+| `FRONT_VALKEY_URL` | The Valkey the Rust front reads the control mapping from (separate from `VALKEY_URL`). Empty → in-memory, tests only |
+| `CONTROL_MAPPING_REWARM_INTERVAL_SECONDS` | Beat interval that rewrites the control mapping from Postgres (default 600) |
 | `STRIPE_API_KEY` | Stripe (billing; stub-tolerant) |
 | `STRIPE_WEBHOOK_SECRET` | Stripe webhooks |
 | `OFFLOAD_EXECUTION_MODE` | `stub` for local/tests; `runpod` for the production Python worker |
@@ -140,7 +144,7 @@ Django sets `search_path=control,public`. Settings force
 
 ## HTTP surface
 
-- `POST /webhooks/workos` — WorkOS events (signature required)
+- `POST /webhooks/workos` — verifies the WorkOS signature, then queues the account sync
 - `POST /internal/offload/invoke` — enqueue a tenant-bound Celery task
 - `POST /internal/offload/artifact-upload` — mint a tenant-scoped, short-lived Arrow upload URL
 - `GET /internal/offload/{job_id}` — return the caller tenant's job status + ArrowBatch descriptor
@@ -164,6 +168,34 @@ Django sets `search_path=control,public`. Settings force
 - `POST /internal/rendering/descriptor` — refresh a short-lived descriptor for one exact tenant-owned render key
 - `/admin/` — ops console (revoke key, re-run job, reset usage, impersonate grant)
 - `GET /healthz`
+
+### WorkOS accounts
+
+Sign-in is WorkOS AuthKit. Django keeps the accounts (`control_user`,
+`control_membership`, one tenant per WorkOS organization) by reading the WorkOS
+Events API on the beat schedule, after a stored cursor; the webhook only makes
+that run sooner. Each event is stored once and applied in order, and a
+membership whose organization has not synced yet waits instead of being lost.
+A tenant's slug is `t-<12 hex>`, never its organization's name, so renaming an
+organization changes only its display name.
+
+A user who signs up without joining an organization gets one: the sync creates
+a WorkOS organization (external id `theorem-signup:<user id>`) with them as
+`owner`, and that organization's events create their tenant, store and sprite.
+
+The Rust front reads two keys from `FRONT_VALKEY_URL`, neither with a TTL:
+`control:org:{org_id}:tenant_slug` and, for users bound to their pre-WorkOS
+principal, `control:user:{workos_user_id}:principal` (`identity:<12 hex>`).
+Postgres holds both; workers rewrite them on start and on the beat schedule.
+
+```bash
+python manage.py bind_workos_owner --organization org_... --user user_... --principal identity:<12 hex>
+python manage.py warm_control_mapping
+```
+
+`bind_workos_owner` gives the existing owner tenant its organization and binds
+the owner's WorkOS user to their principal; until it has run, the sync waits.
+`warm_control_mapping` backfills the front's Valkey from Postgres.
 
 ### Offload machine-key admission
 
