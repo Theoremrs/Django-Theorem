@@ -21,3 +21,6 @@ celerybeat-schedule
 *.log
 /var/
 /mlruns/
+
+# Versioned build outputs
+release-assets/
