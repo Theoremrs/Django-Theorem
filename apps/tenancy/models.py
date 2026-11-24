@@ -25,6 +25,15 @@ class Tenant(models.Model):
     class Meta:
         db_table = "control_tenant"
         ordering = ["slug"]
+        constraints = [
+            # One tenant per WorkOS organization: the front maps an org id to
+            # exactly one tenant slug.
+            models.UniqueConstraint(
+                fields=["workos_organization_id"],
+                condition=~models.Q(workos_organization_id=""),
+                name="control_tenant_workos_organization_unique",
+            )
+        ]
 
     def __str__(self) -> str:
         return f"{self.slug} ({self.display_name})"

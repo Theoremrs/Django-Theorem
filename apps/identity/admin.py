@@ -3,14 +3,14 @@ from django.utils import timezone
 
 from apps.support.models import ImpersonationGrant
 
-from .models import Membership, User
+from .models import Membership, User, WorkOSEvent
 
 
 @admin.register(User)
 class UserAdmin(admin.ModelAdmin):
-    list_display = ("email", "workos_user_id", "display_name", "is_active")
-    list_filter = ("is_active",)
-    search_fields = ("email", "workos_user_id", "display_name")
+    list_display = ("email", "workos_user_id", "display_name", "legacy_principal", "is_active")
+    list_filter = ("is_active", "self_serve_pending")
+    search_fields = ("email", "workos_user_id", "display_name", "legacy_principal")
     actions = ["impersonate"]
 
     @admin.action(description="Impersonate (mint short-lived scoped token, logged)")
@@ -44,3 +44,16 @@ class MembershipAdmin(admin.ModelAdmin):
     list_filter = ("role", "tenant")
     search_fields = ("user__email", "tenant__slug")
     raw_id_fields = ("user", "tenant")
+
+
+@admin.register(WorkOSEvent)
+class WorkOSEventAdmin(admin.ModelAdmin):
+    """The WorkOS events the sync has read, and why any are still waiting."""
+
+    list_display = ("event_id", "event_type", "status", "attempts", "occurred_at", "applied_at")
+    list_filter = ("status", "event_type")
+    search_fields = ("event_id", "last_error")
+    readonly_fields = [field.name for field in WorkOSEvent._meta.fields]
+
+    def has_add_permission(self, request):
+        return False
