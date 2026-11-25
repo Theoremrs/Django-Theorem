@@ -1,0 +1,65 @@
+# Theorem's standard scientific Python environment.
+#
+# Provisioned by uv into the Theorem Python home with a uv-managed CPython, never
+# the system interpreter: `uv sync --frozen` against the committed uv.lock. The
+# list is a baseline, not a limit: an agent derives a specialized environment by
+# adding requirements, and `accelerated` is synced only for work that asks for it
+# on hardware that can use it.
+[project]
+name = "theorem-scientific"
+version = "1.0.0"
+requires-python = ">=3.13,<3.14"
+dependencies = [
+    # numerical
+    "numpy>=2.2",
+    "scipy>=1.15",
+    # symbolic
+    "sympy>=1.13",
+    # data processing
+    "polars>=1.20",
+    "pandas>=2.2",
+    "pyarrow>=19",
+    # analytical queries
+    "duckdb>=1.2",
+    # statistics
+    "statsmodels>=0.14.4",
+    # machine learning
+    "scikit-learn>=1.6",
+    # visualization
+    "matplotlib>=3.10",
+    "plotly>=6",
+    "altair>=5.5",
+    # image processing
+    "pillow>=11",
+    "opencv-python-headless>=4.11",
+    # optimization
+    "cvxpy>=1.6",
+    "ortools>=9.12",
+    # graphs and networks
+    "networkx>=3.4",
+    # geospatial
+    "geopandas>=1.0",
+    "shapely>=2.0.7",
+    "pyproj>=3.7",
+    # simulation
+    "simpy>=4.1",
+    "numba>=0.61",
+    # research and documents
+    "lxml>=5.3",
+    "beautifulsoup4>=4.13",
+    "pymupdf>=1.25",
+]
+
+[project.optional-dependencies]
+# CPU and Apple-silicon builds; CUDA hosts add `cuda`.
+accelerated = [
+    "torch>=2.6",
+    "jax>=0.5",
+]
+cuda = [
+    "cupy-cuda12x>=13.4; sys_platform == 'linux'",
+    "jax[cuda12]>=0.5; sys_platform == 'linux'",
+]
+
+[tool.uv]
+package = false
