@@ -48,6 +48,8 @@ dependencies = [
     "lxml>=5.3",
     "beautifulsoup4>=4.13",
     "pymupdf>=1.25",
+    # notebooks: marimo artifacts run natively in this environment
+    "marimo>=0.17",
 ]
 
 [project.optional-dependencies]
