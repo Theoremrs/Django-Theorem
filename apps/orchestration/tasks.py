@@ -23,7 +23,9 @@ from django.conf import settings
 from django.utils import timezone as dj_timezone
 import pyarrow as pa
 
+from apps.orchestration import scientific
 from apps.orchestration.artifacts import (
+    GZIP_CONTENT_TYPE,
     ArtifactConfigurationError,
     ArtifactStore,
     ArtifactStorageError,
@@ -136,12 +138,16 @@ def _is_extraction_operation_for_dispatch(job_id: str) -> bool:
 def _runpod_endpoint_id(operation: str) -> str:
     if operation.startswith("data_science.extraction."):
         return settings.RUNPOD_EXTRACTION_ENDPOINT_ID
+    if operation == scientific.OPERATION:
+        return settings.RUNPOD_SCIENTIFIC_ENDPOINT_ID
     return settings.RUNPOD_SERVERLESS_ENDPOINT_ID
 
 
 def _runpod_image_digest(operation: str) -> str:
     if operation.startswith("data_science.extraction."):
         return settings.RUNPOD_EXTRACTION_IMAGE_DIGEST
+    if operation == scientific.OPERATION:
+        return settings.RUNPOD_SCIENTIFIC_IMAGE_DIGEST
     return settings.RUNPOD_WORKER_IMAGE_DIGEST
 
 
@@ -260,7 +266,9 @@ def _append_log(job, line: str) -> None:
     job.logs = f"{job.logs}{line.rstrip()}\n"[-16_000:]
 
 
-def _fail_job(job_id: str, error: str, *, log_prefix: str) -> dict[str, str]:
+def _fail_job(
+    job_id: str, error: str, *, log_prefix: str, error_code: str = "", remote_logs: str = ""
+) -> dict[str, str]:
     from apps.orchestration.models import Job
 
     job = Job.objects.get(id=job_id)
@@ -268,9 +276,12 @@ def _fail_job(job_id: str, error: str, *, log_prefix: str) -> dict[str, str]:
         return {"status": "canceled"}
     job.status = Job.Status.FAILED
     job.error = error
+    job.error_code = error_code
     job.ended_at = dj_timezone.now()
+    if remote_logs:
+        _append_log(job, f"[{log_prefix} remote] {remote_logs[-2_000:]}")
     _append_log(job, f"[{log_prefix}] failed: {error}")
-    job.save(update_fields=["status", "error", "ended_at", "logs", "updated_at"])
+    job.save(update_fields=["status", "error", "error_code", "ended_at", "logs", "updated_at"])
     return {"status": "failed", "error": error}
 
 
@@ -290,6 +301,27 @@ def _output_descriptor(output: Any) -> tuple[str, int | None, str]:
     return schema_json, rows, payload_digest
 
 
+class RunpodHandlerError(ValueError):
+    """The worker's handler reported a failure, with its code and log tail when given."""
+
+    def __init__(self, message: str, *, code: str = "", logs: str = "") -> None:
+        super().__init__(message)
+        self.code = code
+        self.logs = logs
+
+
+def _handler_failure(error: Any, envelope_output: Any) -> RunpodHandlerError:
+    message = str(error)
+    details = envelope_output if isinstance(envelope_output, Mapping) else {}
+    code = str(details.get("code") or scientific.error_code(message))
+    logs = details.get("logs")
+    return RunpodHandlerError(
+        f"RunPod handler error: {message}",
+        code=code,
+        logs=logs if isinstance(logs, str) else "",
+    )
+
+
 def _runpod_handler_output(result: Mapping[str, Any]) -> Any:
     """Extract the handler payload from RunPod's asynchronous status envelope."""
     envelope_output = result.get("output")
@@ -298,7 +330,7 @@ def _runpod_handler_output(result: Mapping[str, Any]) -> Any:
     # Preserve explicit handler errors (P2: Preserve explicit RunPod handler errors)
     handler_error = envelope_output.get("error")
     if handler_error:
-        raise ValueError(f"RunPod handler error: {handler_error}")
+        raise _handler_failure(handler_error, envelope_output)
     return envelope_output.get("output")
 
 
@@ -334,17 +366,41 @@ def _post_provenance(job, *, engine: str, agent_name: str, code_ref: str) -> Non
     )
 
 
+def _charge_remote_execution(
+    job, client: RunpodServerlessClient, remote_job_id: str, *, state: Mapping[str, Any] | None = None
+) -> None:
+    """Meter RunPod's billed execution time; a job that stopped early still ran."""
+    if job.cost_usd is not None:
+        return
+    if state is None or "executionTime" not in state:
+        try:
+            state = client.status(remote_job_id)
+        except RunpodApiError as exc:
+            _append_log(job, f"[RunPod] execution time unavailable: {exc}")
+            job.save(update_fields=["logs", "updated_at"])
+            return
+    cost = scientific.cost_from_status(dict(state))
+    if cost is not None:
+        scientific.charge(job, cost)
+
+
 def _run_runpod_offload(job_id: str) -> dict[str, str]:
     from apps.orchestration.models import Job
 
     job = Job.objects.get(id=job_id)
     if job.status == Job.Status.CANCELED:
         return {"status": "canceled"}
+    remote_job_id: str | None = None
+    is_scientific = job.operation == scientific.OPERATION
     try:
         if job.tenant_id is None:
             raise ArtifactValidationError("RunPod jobs require an admitted tenant")
         store = ArtifactStore.from_settings()
-        output_artifact_key = store.output_key(job.tenant_id, job.operation_id)
+        output_artifact_key = (
+            store.output_key(job.tenant_id, job.operation_id, extension=scientific.OUTPUT_EXTENSION)
+            if is_scientific
+            else store.output_key(job.tenant_id, job.operation_id)
+        )
         endpoint_id = _runpod_endpoint_id(job.operation)
         image_digest = _runpod_image_digest(job.operation)
         if not endpoint_id:
@@ -361,9 +417,16 @@ def _run_runpod_offload(job_id: str) -> dict[str, str]:
             base_url=settings.RUNPOD_API_BASE,
             timeout_seconds=settings.RUNPOD_REQUEST_TIMEOUT_SECONDS,
         )
-        submitted = client.submit(
-            _runpod_input(job, store=store, output_artifact_key=output_artifact_key)
-        )
+        if is_scientific:
+            submitted = client.submit(
+                scientific.runpod_input(job, store=store, output_artifact_key=output_artifact_key),
+                policy=scientific.runpod_policy(job),
+            )
+        else:
+            submitted = client.submit(
+                _runpod_input(job, store=store, output_artifact_key=output_artifact_key)
+            )
+        remote_job_id = submitted.job_id
         metadata = dict(job.kwargs_json)
         metadata["output_artifact_key"] = output_artifact_key
         metadata["runpod"] = {
@@ -407,7 +470,11 @@ def _run_runpod_offload(job_id: str) -> dict[str, str]:
 
         result = client.wait(
             submitted.job_id,
-            timeout_seconds=settings.RUNPOD_JOB_TIMEOUT_SECONDS,
+            timeout_seconds=(
+                scientific.control_deadline_seconds(job)
+                if is_scientific
+                else settings.RUNPOD_JOB_TIMEOUT_SECONDS
+            ),
             poll_interval_seconds=settings.RUNPOD_POLL_INTERVAL_SECONDS,
             on_update=persist_status,
         )
@@ -424,23 +491,55 @@ def _run_runpod_offload(job_id: str) -> dict[str, str]:
         if "Job was cancelled during execution" in error_msg:
             job.refresh_from_db()
             if job.status == Job.Status.CANCELED:
+                # The cancel request may have run before the RunPod id was
+                # persisted; cancelling again is idempotent and stops the spend.
+                try:
+                    client.cancel(remote_job_id)
+                except RunpodApiError as cancel_exc:
+                    _append_log(job, f"[RunPod] remote cancel failed: {cancel_exc}")
+                    job.save(update_fields=["logs", "updated_at"])
+                if is_scientific:
+                    _charge_remote_execution(job, client, remote_job_id)
                 return {"status": "canceled"}
+        if remote_job_id is not None and is_scientific:
+            _charge_remote_execution(job, client, remote_job_id)
         return _fail_job(job_id, error_msg, log_prefix="RunPod")
 
+    if is_scientific:
+        _charge_remote_execution(job, client, remote_job_id, state=result)
     if result["status"] != RunpodServerlessClient.SUCCESS:
+        message = str(result.get("error") or f"RunPod job finished as {result['status']}")
+        # A handler's returned error fails the RunPod job; its other fields stay in output.
+        failure = _handler_failure(message, result.get("output"))
         return _fail_job(
             job_id,
-            str(result.get("error") or f"RunPod job finished as {result['status']}"),
+            message,
             log_prefix="RunPod",
+            error_code=failure.code,
+            remote_logs=failure.logs,
         )
     try:
-        schema_json, rows, payload_digest = _output_descriptor(_runpod_handler_output(result))
-        verified_output = store.read_arrow(
-            job.tenant_id,
-            output_artifact_key,
-            expected_digest=payload_digest,
-            expected_schema_json=schema_json,
-            expected_rows=rows,
+        handler_output = _runpod_handler_output(result)
+        if is_scientific:
+            payload_digest, _size = scientific.output_descriptor(handler_output)
+            verified_output = store.read_content(
+                job.tenant_id,
+                output_artifact_key,
+                expected_digest=payload_digest,
+                media_type=GZIP_CONTENT_TYPE,
+            )
+        else:
+            schema_json, rows, payload_digest = _output_descriptor(handler_output)
+            verified_output = store.read_arrow(
+                job.tenant_id,
+                output_artifact_key,
+                expected_digest=payload_digest,
+                expected_schema_json=schema_json,
+                expected_rows=rows,
+            )
+    except RunpodHandlerError as exc:
+        return _fail_job(
+            job_id, str(exc), log_prefix="RunPod", error_code=exc.code, remote_logs=exc.logs
         )
     except (ArtifactStorageError, ArtifactValidationError, ValueError) as exc:
         return _fail_job(job_id, str(exc), log_prefix="RunPod")
@@ -449,9 +548,18 @@ def _run_runpod_offload(job_id: str) -> dict[str, str]:
     if job.status == Job.Status.CANCELED:
         return {"status": "canceled"}
     job.output_artifact_key = verified_output.artifact_key
-    job.output_schema_json = verified_output.schema_json
-    job.output_rows = verified_output.rows
     job.output_payload_digest = verified_output.payload_digest
+    if is_scientific:
+        envelope = result["output"]
+        metadata = dict(job.kwargs_json)
+        if isinstance(envelope.get("worker"), Mapping):
+            metadata["worker"] = dict(envelope["worker"])
+        job.kwargs_json = metadata
+        if isinstance(envelope.get("logs"), str) and envelope["logs"]:
+            _append_log(job, f"[RunPod remote] {envelope['logs'][-2_000:]}")
+    else:
+        job.output_schema_json = verified_output.schema_json
+        job.output_rows = verified_output.rows
     job.status = Job.Status.SUCCEEDED
     job.ended_at = dj_timezone.now()
     _append_log(job, f"[RunPod] completed {submitted.job_id}")

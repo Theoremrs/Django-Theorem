@@ -140,6 +140,15 @@ RUNPOD_POLL_INTERVAL_SECONDS = env.float("RUNPOD_POLL_INTERVAL_SECONDS", default
 RUNPOD_WORKER_IMAGE_DIGEST = env("RUNPOD_WORKER_IMAGE_DIGEST", default="")
 RUNPOD_EXTRACTION_ENDPOINT_ID = env("RUNPOD_EXTRACTION_ENDPOINT_ID", default="")
 RUNPOD_EXTRACTION_IMAGE_DIGEST = env("RUNPOD_EXTRACTION_IMAGE_DIGEST", default="")
+# The scientific Python worker (runpod/theorem_scientific_python_worker) runs
+# Theorem computation bundles on its own GPU endpoint. Its price per second is
+# the endpoint GPU class's RunPod rate: budgets are refused against
+# timeout_seconds x price, and actual cost is RunPod's executionTime x price.
+RUNPOD_SCIENTIFIC_ENDPOINT_ID = env("RUNPOD_SCIENTIFIC_ENDPOINT_ID", default="")
+RUNPOD_SCIENTIFIC_IMAGE_DIGEST = env("RUNPOD_SCIENTIFIC_IMAGE_DIGEST", default="")
+RUNPOD_SCIENTIFIC_PRICE_PER_SECOND_USD = env(
+    "RUNPOD_SCIENTIFIC_PRICE_PER_SECOND_USD", default="0"
+)
 RUNPOD_PODS_API_BASE = env("RUNPOD_PODS_API_BASE", default="https://rest.runpod.io/v1")
 RL_RUNPOD_IMAGE_DIGEST = env("RL_RUNPOD_IMAGE_DIGEST", default="")
 RL_RUNPOD_GPU_TYPE = env("RL_RUNPOD_GPU_TYPE", default="NVIDIA GeForce RTX 4090")

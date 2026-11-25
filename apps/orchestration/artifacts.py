@@ -16,6 +16,7 @@ from django.conf import settings
 
 
 ARROW_IPC_CONTENT_TYPE = "application/vnd.apache.arrow.stream"
+GZIP_CONTENT_TYPE = "application/gzip"
 SHA256_PREFIX = "sha256:"
 
 
@@ -253,9 +254,16 @@ class ArtifactStore:
     def allocate_input_key(self, tenant_id: UUID) -> str:
         return f"{self.tenant_prefix(tenant_id)}inputs/{uuid4()}.arrow"
 
-    def output_key(self, tenant_id: UUID, operation_id: str) -> str:
+    def allocate_content_key(self, tenant_id: UUID, payload_digest: str) -> str:
+        """Content-addressed upload key: the same bytes always land on one key."""
+        digest = self._content_digest(payload_digest)
+        return f"{self.tenant_prefix(tenant_id)}content/{digest}"
+
+    def output_key(
+        self, tenant_id: UUID, operation_id: str, *, extension: str = "arrow"
+    ) -> str:
         operation_hash = hashlib.sha256(operation_id.encode("utf-8")).hexdigest()
-        return f"{self.tenant_prefix(tenant_id)}outputs/{operation_hash}.arrow"
+        return f"{self.tenant_prefix(tenant_id)}outputs/{operation_hash}.{extension}"
 
     @staticmethod
     def _content_digest(value: str) -> str:
@@ -524,6 +532,7 @@ class ArtifactStore:
         key = self.validate_key(tenant_id, artifact_key)
         if content_type not in {
             ARROW_IPC_CONTENT_TYPE,
+            GZIP_CONTENT_TYPE,
             "application/json",
             "application/jsonl",
             "text/csv",
@@ -567,6 +576,28 @@ class ArtifactStore:
             raise ArtifactStorageError("artifact storage read failed") from exc
         except BotoCoreError as exc:
             raise ArtifactStorageError("artifact storage read failed") from exc
+
+    def read_content(
+        self,
+        tenant_id: UUID,
+        artifact_key: str,
+        *,
+        expected_digest: str,
+        media_type: str,
+    ) -> StoredContentArtifact:
+        """Read an opaque content artifact and prove it holds the claimed bytes."""
+        payload = self.get_bytes(tenant_id, artifact_key)
+        actual_digest = sha256_digest(payload)
+        if actual_digest != expected_digest:
+            raise ArtifactValidationError(
+                "artifact payload digest does not match the descriptor"
+            )
+        return StoredContentArtifact(
+            artifact_key=artifact_key,
+            payload_digest=actual_digest,
+            media_type=media_type,
+            byte_length=len(payload),
+        )
 
     def read_arrow(
         self,

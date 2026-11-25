@@ -18,9 +18,12 @@ from apps.keys.auth import (
     OFFLOAD_READ_SCOPE,
     require_machine_key,
 )
+from apps.orchestration import scientific
 from apps.orchestration.artifacts import (
     ARROW_IPC_CONTENT_TYPE,
+    GZIP_CONTENT_TYPE,
     ArtifactConfigurationError,
+    ArtifactNotFoundError,
     ArtifactStore,
     ArtifactStorageError,
     ArtifactValidationError,
@@ -42,8 +45,12 @@ REGISTERED_OPERATIONS = frozenset(
         "data_science.r.survey_weight",
         "data_science.r.mixed_model",
         "data_science.r.survival",
+        # Theorem computation bundles on the scientific Python RunPod worker
+        scientific.OPERATION,
     }
 )
+# Opaque uploads that are not Arrow batches; each names the operation reading it.
+CONTENT_UPLOAD_TYPES = frozenset({GZIP_CONTENT_TYPE})
 
 ACTIVE_JOB_STATUSES = (Job.Status.QUEUED, Job.Status.RUNNING)
 
@@ -83,6 +90,12 @@ class ArtifactUploadResponse(Schema):
     )
 
 
+class ContentUploadRequest(Schema):
+    content_type: str
+    payload_digest: str
+    bytes: int
+
+
 class JobStatusResponse(Schema):
     job_id: UUID
     operation: str
@@ -90,7 +103,9 @@ class JobStatusResponse(Schema):
     status: str
     output: ArrowBatchDescriptor | None = None
     error: str = ""
+    error_code: str = ""
     logs: str = ""
+    cost_usd: float | None = None
 
 
 def _enforce_concurrent_job_quota(tenant_id: UUID) -> None:
@@ -144,15 +159,70 @@ def begin_artifact_upload(request):
         raise HttpError(503, "artifact storage unavailable") from exc
 
 
+@router.post("/content-upload", response=ArtifactUploadResponse)
+def begin_content_upload(request, body: ContentUploadRequest):
+    """Mint a PUT for one content-addressed blob, such as a computation bundle."""
+    principal = require_machine_key(request, scope=OFFLOAD_INVOKE_SCOPE)
+    if body.content_type not in CONTENT_UPLOAD_TYPES:
+        raise HttpError(400, f"content_type must be one of {sorted(CONTENT_UPLOAD_TYPES)}")
+    if not is_sha256_digest(body.payload_digest):
+        raise HttpError(400, "payload_digest must be a sha256 digest")
+    if body.bytes <= 0:
+        raise HttpError(400, "bytes must be positive")
+    store = _artifact_store_or_503()
+    if body.bytes > store.max_bytes:
+        raise HttpError(413, f"bytes exceeds the {store.max_bytes}-byte artifact limit")
+    try:
+        artifact_key = store.allocate_content_key(principal.tenant.id, body.payload_digest)
+        return ArtifactUploadResponse(
+            artifact_key=artifact_key,
+            upload_url=store.presign_put_content(
+                principal.tenant.id, artifact_key, content_type=body.content_type
+            ),
+            expires_in_seconds=store.presign_seconds,
+            required_headers={"Content-Type": body.content_type},
+        )
+    except ArtifactStorageError as exc:
+        raise HttpError(503, "artifact storage unavailable") from exc
+
+
+def _validate_scientific_invoke(tenant_id: UUID, body: InvokeRequest) -> scientific.ScientificParams:
+    """Shape always; the bundle's existence and digest whenever execution is live."""
+    try:
+        params = scientific.parse_params(body.params)
+        scientific.validate_input(tenant_id, body.input.payload_digest, body.input.artifact_key)
+    except ArtifactValidationError as exc:
+        raise HttpError(400, str(exc)) from exc
+    if settings.OFFLOAD_EXECUTION_MODE == "runpod":
+        store = _artifact_store_or_503()
+        try:
+            store.read_content(
+                tenant_id,
+                body.input.artifact_key,
+                expected_digest=body.input.payload_digest,
+                media_type=GZIP_CONTENT_TYPE,
+            )
+        except ArtifactNotFoundError as exc:
+            raise HttpError(400, "input artifact has not been uploaded") from exc
+        except ArtifactValidationError as exc:
+            raise HttpError(400, str(exc)) from exc
+        except ArtifactStorageError as exc:
+            raise HttpError(503, "artifact storage unavailable") from exc
+    return params
+
+
 @router.post("/invoke", response=InvokeResponse)
 def invoke_offload(request, body: InvokeRequest):
     principal = require_machine_key(request, scope=OFFLOAD_INVOKE_SCOPE)
     if body.operation not in REGISTERED_OPERATIONS:
         raise HttpError(400, f"unknown operation: {body.operation}")
+    scientific_params = None
+    if body.operation == scientific.OPERATION:
+        scientific_params = _validate_scientific_invoke(principal.tenant.id, body)
     requires_artifact = settings.OFFLOAD_EXECUTION_MODE == "runpod" or (
         body.operation.startswith("data_science.r.") and settings.R_OFFLOAD_EXECUTION_MODE == "rpy2"
     )
-    if requires_artifact:
+    if requires_artifact and scientific_params is None:
         store = _artifact_store_or_503()
         try:
             store.validate_key(principal.tenant.id, body.input.artifact_key)
@@ -183,6 +253,15 @@ def invoke_offload(request, body: InvokeRequest):
             )
 
         _enforce_concurrent_job_quota(principal.tenant.id)
+        estimate = None
+        if scientific_params is not None:
+            try:
+                estimate = scientific.estimate_usd(scientific_params)
+                scientific.enforce_budget(principal.tenant.id, estimate, scientific_params)
+            except scientific.PricingUnavailable as exc:
+                raise HttpError(503, str(exc)) from exc
+            except scientific.BudgetExceeded as exc:
+                raise HttpError(402, str(exc)) from exc
         job = Job.objects.create(
             operation=body.operation,
             operation_id=body.operation_id,
@@ -196,6 +275,7 @@ def invoke_offload(request, body: InvokeRequest):
                 "input_artifact_key": body.input.artifact_key,
             },
             status=Job.Status.QUEUED,
+            estimated_cost_usd=estimate,
         )
     async_result = dispatch_offload.delay(str(job.id))
     job.celery_task_id = async_result.id or ""
@@ -235,7 +315,9 @@ def get_offload_job(request, job_id: UUID):
         status=job.status,
         output=output,
         error=job.error,
+        error_code=job.error_code,
         logs=job.logs,
+        cost_usd=None if job.cost_usd is None else float(job.cost_usd),
     )
 
 
