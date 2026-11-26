@@ -28,6 +28,7 @@ from apps.tenancy.environment import (
     BUNDLE_ENTRIES,
     CODEMODE_PROBE_PATH,
     CODEMODE_TOKEN_PATH,
+    COMPUTE_PROBE_PATH,
     HOST_TOKEN_PATH,
     INSTALL_BUNDLE,
     LEGACY_SERVICE,
@@ -154,7 +155,8 @@ class FakeSprite:
         return self.files[self.services[service]["env"][variable]][0]
 
     def answer(self, request: httpx.Request) -> httpx.Response:
-        """Caddy, codemode-serve and theorem-ide-host as the bundle runs them."""
+        """Caddy, codemode-serve, theorem-compute-serve and theorem-ide-host as
+        the bundle runs them."""
         path = request.url.path
         bearer = request.headers.get("authorization")
         if path == "/codemode/healthz":
@@ -168,6 +170,17 @@ class FakeSprite:
             if bearer != f"Bearer {token}":
                 return httpx.Response(401, json={"error": "unauthorized"})
             return httpx.Response(404, json={"error": "no such session"})
+        if path == "/compute/healthz":
+            if not self._up("compute"):
+                return httpx.Response(502, text="no service")
+            return httpx.Response(200, text="ok")
+        if path == COMPUTE_PROBE_PATH:
+            if not self._up("compute"):
+                return httpx.Response(502, text="no service")
+            token = self._secret("compute", "THEOREM_COMPUTE_TOKEN_FILE")
+            if bearer != f"Bearer {token}":
+                return httpx.Response(401, json={"code": "unauthorized"})
+            return httpx.Response(404, json={"code": "not_found"})
         if path == OPERATIONS_PATH:
             if not self._up("ide-host"):
                 return httpx.Response(502, text="no service")
@@ -329,7 +342,13 @@ def test_provision_builds_a_public_sprite_running_the_bundle(env_configured):
     assert codemode["env"]["THEOREM_CODEMODE_TOKEN_FILE"] == CODEMODE_TOKEN_PATH
     assert router["cmd"] == f"{THEOREM_ROOT}/current/run/router"
     assert router["http_port"] == 8080
-    assert set(router["needs"]) == {"ide-host", "codemode"}
+    compute = sprite.services["compute"]
+    assert compute["cmd"] == f"{THEOREM_ROOT}/current/run/compute"
+    assert compute["env"]["PORT"] == "8083"
+    # Compute serves under code mode's credential.
+    assert compute["env"]["THEOREM_COMPUTE_TOKEN_FILE"] == CODEMODE_TOKEN_PATH
+    assert compute["http_port"] is None
+    assert set(router["needs"]) == {"ide-host", "codemode", "compute"}
     assert sprite.running == {name: BUNDLE_SHA for name in SERVICES}
 
     assert host.state == EnvironmentHost.State.SERVING
@@ -486,6 +505,7 @@ def test_an_existing_sprite_behind_org_auth_is_made_public(env_configured):
     ("open_path", "seen"),
     [
         (CODEMODE_PROBE_PATH, "code mode anonymous 200"),
+        (COMPUTE_PROBE_PATH, "compute anonymous 200"),
         (OPERATIONS_PATH, "host anonymous 200"),
     ],
 )
@@ -553,6 +573,7 @@ def _binding(host: EnvironmentHost) -> dict:
             "url": host.url,
             "token_file": STORE_TOKEN_FILE,
             "codemode_token_file": STORE_CODEMODE_TOKEN_FILE,
+            "compute_token_file": STORE_CODEMODE_TOKEN_FILE,
         }
     }
 

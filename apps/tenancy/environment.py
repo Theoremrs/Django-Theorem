@@ -2,17 +2,20 @@
 
 Signup creates a tenant; ``begin_environment`` records the sprite it will get
 and ``provision_environment`` builds it: the sprite, the pinned sprite bundle,
-the two credential files and the three services that run the bundle. The
+the two credential files and the four services that run the bundle. The
 bundle's contract, from its layout to its health checks, is Theorem's
 ``apps/theorem-ide-host/SPRITE-BUNDLE.md``:
 
 - ``ide-host`` runs ``theorem-ide-host``, the workbench's environment host
   (terminal, files, language, runs), on loopback 8081.
 - ``codemode`` runs ``codemode-serve`` on 8082.
+- ``compute`` runs ``theorem-compute-serve`` on 8083: the store's computations
+  in the tenant's scientific Python environment, under the sandbox. It shares
+  code mode's credential.
 - ``router`` runs Caddy on 8080, the sprite URL: ``/api/environment/*`` goes
-  to the host and ``/codemode/*`` to code mode.
+  to the host, ``/codemode/*`` to code mode and ``/compute/*`` to compute.
 
-Provisioning waits until both refuse an anonymous request and accept the
+Provisioning waits until each refuses an anonymous request and accepts the
 tenant's own credential.
 
 ``bind_store`` then tells the tenant's store where its sprite is. The store
@@ -61,11 +64,13 @@ HOST_TOKEN_PATH = f"{HOME}/.config/theorem/environment-token"
 CODEMODE_TOKEN_PATH = f"{HOME}/.config/theorem/codemode-token"
 WORKSPACE_ROOT = f"{HOME}/theorem-environment"
 ROUTER_PORT = 8080
-# The bundle's services, in start order: the router needs the other two.
-SERVICES = ("ide-host", "codemode", "router")
+# The bundle's services, in start order: the router needs the other three.
+SERVICES = ("ide-host", "codemode", "compute", "router")
 OPERATIONS_PATH = "/api/environment/v1/operations"
 CODEMODE_HEALTH_PATH = "/codemode/healthz"
 CODEMODE_PROBE_PATH = "/codemode/v1/sessions/theorem-health-probe/manifest"
+COMPUTE_HEALTH_PATH = "/compute/healthz"
+COMPUTE_PROBE_PATH = "/compute/v1/jobs/cj_theoremhealthprobe/follow"
 # The bare host service an earlier version of this module ran on 8080, where
 # the router now listens.
 LEGACY_SERVICE = "theorem-ide-host"
@@ -86,9 +91,13 @@ BUNDLE_ENTRIES = (
     "bin/theorem-js-cell",
     "bin/hc",
     "bin/caddy",
+    "bin/theorem-compute-serve",
+    "bin/codex-linux-sandbox",
+    "bin/uv",
     "Caddyfile",
     "run/ide-host",
     "run/codemode",
+    "run/compute",
     "run/router",
 )
 BUNDLE_OBJECT_PREFIX = "theorem-sprite-bundle/linux-x86_64"
@@ -285,6 +294,8 @@ def store_binding(tenant: Tenant) -> dict | None:
             "url": host.url,
             "token_file": STORE_TOKEN_FILE,
             "codemode_token_file": STORE_CODEMODE_TOKEN_FILE,
+            # The sprite serves computations under code mode's credential.
+            "compute_token_file": STORE_CODEMODE_TOKEN_FILE,
         }
     }
     return {
@@ -457,10 +468,24 @@ def _service_definitions(tenant: Tenant) -> dict[str, dict]:
                 "THEOREM_CODEMODE_TOKEN_FILE": CODEMODE_TOKEN_PATH,
             },
         },
+        "compute": {
+            "cmd": f"{run}/compute",
+            "args": [],
+            "needs": [],
+            "http_port": None,
+            "dir": HOME,
+            "env": {
+                "RUST_LOG": "info",
+                "PORT": "8083",
+                "THEOREM_COMPUTE_TOKEN_FILE": CODEMODE_TOKEN_PATH,
+                "THEOREM_PYTHON_HOME": f"{THEOREM_ROOT}/python",
+                "THEOREM_COMPUTE_HOME": f"{THEOREM_ROOT}/compute",
+            },
+        },
         "router": {
             "cmd": f"{run}/router",
             "args": [],
-            "needs": ["ide-host", "codemode"],
+            "needs": ["ide-host", "codemode", "compute"],
             "http_port": ROUTER_PORT,
             "dir": HOME,
             "env": {},
@@ -549,8 +574,8 @@ def _wait_ready(
     http: httpx.Client | None,
     poll_interval_seconds: float,
 ) -> None:
-    """Wait until code mode and the host each refuse a stranger and answer
-    their tenant's credential.
+    """Wait until code mode, compute and the host each refuse a stranger and
+    answer their tenant's credential.
 
     The first request also wakes a sleeping sprite.
     """
@@ -563,6 +588,10 @@ def _wait_ready(
         ("code mode anonymous", CODEMODE_PROBE_PATH, {}, 401),
         # The probe session does not exist: 404 shows the credential was accepted.
         ("code mode token", CODEMODE_PROBE_PATH, codemode, 404),
+        ("compute health", COMPUTE_HEALTH_PATH, {}, 200),
+        ("compute anonymous", COMPUTE_PROBE_PATH, {}, 401),
+        # No such job: 404 shows the credential was accepted.
+        ("compute token", COMPUTE_PROBE_PATH, codemode, 404),
         ("host anonymous", OPERATIONS_PATH, {}, 401),
         ("host token", OPERATIONS_PATH, bound, 200),
     )
