@@ -93,6 +93,7 @@ BUNDLE_ENTRIES = (
     "bin/caddy",
     "bin/theorem-compute-serve",
     "bin/codex-linux-sandbox",
+    "bin/bwrap",
     "bin/uv",
     "Caddyfile",
     "run/ide-host",
