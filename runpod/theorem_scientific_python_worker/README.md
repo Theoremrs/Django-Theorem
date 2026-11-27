@@ -93,7 +93,10 @@ handler's result, terminates the Pod once that result is read (or at the job's
 timeout plus boot and transfer time), and meters the Pod's own hourly `cost`
 for the time it lived. Set `RUNPOD_SCIENTIFIC_POD_GPU_TYPE`,
 `RUNPOD_SCIENTIFIC_POD_CLOUD_TYPE` and `RUNPOD_SCIENTIFIC_POD_PRICE_PER_HOUR_USD`
-(an upper bound for that GPU, which prices the estimate).
+(an upper bound for that GPU, which prices the estimate). An image in a private
+registry such as `registry.fly.io` also needs
+`RUNPOD_SCIENTIFIC_POD_REGISTRY_AUTH_ID`, the id of a RunPod container registry
+credential (`POST /v2/registries`) that can pull it.
 
 Either way a job's estimate must fit `RUNPOD_SCIENTIFIC_MAX_JOB_USD` (default
 $5) and what is left of `RUNPOD_SCIENTIFIC_MONTHLY_USD` (default $50), which

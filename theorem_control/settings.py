@@ -163,6 +163,9 @@ RUNPOD_SCIENTIFIC_POD_DISK_GB = env.int("RUNPOD_SCIENTIFIC_POD_DISK_GB", default
 RUNPOD_SCIENTIFIC_POD_PRICE_PER_HOUR_USD = env(
     "RUNPOD_SCIENTIFIC_POD_PRICE_PER_HOUR_USD", default="0"
 )
+# The RunPod container registry credential (its id) a Pod pulls a private
+# image with, such as one on registry.fly.io; empty for a public image.
+RUNPOD_SCIENTIFIC_POD_REGISTRY_AUTH_ID = env("RUNPOD_SCIENTIFIC_POD_REGISTRY_AUTH_ID", default="")
 RUNPOD_PODS_API_BASE = env("RUNPOD_PODS_API_BASE", default="https://api.runpod.io/v2")
 RL_RUNPOD_IMAGE_DIGEST = env("RL_RUNPOD_IMAGE_DIGEST", default="")
 RL_RUNPOD_GPU_TYPE = env("RL_RUNPOD_GPU_TYPE", default="NVIDIA GeForce RTX 4090")

@@ -755,6 +755,7 @@ def test_a_pod_runs_the_bundle_then_is_terminated_and_metered(client, s3, pods, 
     assert fake.created["image"] == "ghcr.io/theorem/scientific@sha256:immutable"
     assert fake.created["cmd"][-1] == "--pod"
     assert fake.created["gpu"] == {"id": "NVIDIA GeForce RTX 4090", "count": 1, "minCudaVersion": "13.0"}
+    assert "registry" not in fake.created
     assert fake.terminated == ["pod-1"]
     assert job.status == Job.Status.SUCCEEDED
     assert job.output_payload_digest == "sha256:" + hashlib.sha256(result_tarball).hexdigest()
@@ -837,3 +838,15 @@ def test_the_worker_on_a_pod_reports_once_then_waits(monkeypatch):
     assert sent[0].full_url == "https://storage.example/put"
     assert json.loads(sent[0].data) == {"output": {"bytes": 1}}
     assert worker.POD_REQUEST_ENV not in __import__("os").environ
+
+
+@pytest.mark.django_db
+@override_settings(**(POD | {"RUNPOD_SCIENTIFIC_POD_REGISTRY_AUTH_ID": "reg-fly"}))
+def test_a_pod_pulls_a_private_image_with_the_registry_credential(client, s3, pods):
+    s3.objects[_content_key(client.tenant)] = BUNDLE
+    pods.report = lambda fake, request: None
+    job = _running_job(client.tenant, resources=POD_RESOURCES)
+
+    run_offload_python(str(job.id))
+
+    assert pods.instances[0].created["registry"] == "reg-fly"

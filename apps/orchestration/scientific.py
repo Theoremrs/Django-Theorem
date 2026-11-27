@@ -270,7 +270,7 @@ def pod_request(
     request["result_url"] = store.presign_put_content(
         job.tenant_id, result_artifact_key, content_type="application/json"
     )
-    return {
+    pod = {
         "name": f"theorem-scientific-{str(job.id)[:12]}",
         "image": settings.RUNPOD_SCIENTIFIC_IMAGE_DIGEST,
         "cloud": settings.RUNPOD_SCIENTIFIC_POD_CLOUD_TYPE,
@@ -280,6 +280,9 @@ def pod_request(
         "cmd": POD_COMMAND,
         "env": {"THEOREM_SCIENTIFIC_REQUEST": json.dumps(request, sort_keys=True)},
     }
+    if settings.RUNPOD_SCIENTIFIC_POD_REGISTRY_AUTH_ID:
+        pod["registry"] = settings.RUNPOD_SCIENTIFIC_POD_REGISTRY_AUTH_ID
+    return pod
 
 
 def pod_deadline_seconds(job) -> int:
