@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""RunPod Serverless worker that runs one Theorem computation bundle.
+"""RunPod worker that runs one Theorem computation bundle, on Serverless or a Pod.
 
 The control plane sends ``theorem.scientific_python.v1``: a presigned GET for a
 gzip tarball of a Theorem job directory (``request.json``, ``runner.py``,
@@ -514,7 +514,7 @@ def handler(job: dict[str, Any]) -> dict[str, Any]:
             worker = {
                 **gpu_identity(),
                 "python_version": baked_python_version(),
-                "executor": "runpod-serverless",
+                "executor": job.get("executor", "runpod-serverless"),
                 "runpod_job_id": job.get("id"),
                 "execution_ms": execution_ms,
                 "cost_usd": float((price * execution_ms / 1000).quantize(Decimal("0.000001"))),
@@ -557,9 +557,36 @@ def run_local(input_path: str) -> int:
     return 0 if "error" not in result else 1
 
 
+POD_REQUEST_ENV = "THEOREM_SCIENTIFIC_REQUEST"
+
+
+def run_pod() -> None:
+    """One job on a RunPod Pod. The request comes in the environment with a
+    presigned PUT for the handler's result; the control plane reads that result
+    and terminates the Pod. The process then waits, so a Pod that restarts its
+    container never runs the job twice."""
+    request = json.loads(os.environ.pop(POD_REQUEST_ENV))
+    result_url = request.pop("result_url")
+    result = handler({"id": os.environ.get("RUNPOD_POD_ID", "pod"), "executor": "runpod-pod", "input": request})
+    body = json.dumps(result, sort_keys=True).encode()
+    put = Request(
+        result_url,
+        data=body,
+        method="PUT",
+        headers={"Content-Type": "application/json", "Content-Length": str(len(body))},
+    )
+    with urlopen(put, timeout=120):  # noqa: S310 - signed capability from Django.
+        pass
+    print("theorem scientific worker: result reported; waiting for the Pod to end", flush=True)
+    while True:
+        signal.pause()
+
+
 if __name__ == "__main__":
     if len(sys.argv) == 3 and sys.argv[1] == "--local-input":
         raise SystemExit(run_local(sys.argv[2]))
+    if len(sys.argv) == 2 and sys.argv[1] == "--pod":
+        run_pod()
     import runpod
 
     print(

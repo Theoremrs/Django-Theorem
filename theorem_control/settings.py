@@ -153,7 +153,17 @@ RUNPOD_SCIENTIFIC_PRICE_PER_SECOND_USD = env(
 # what every tenant's jobs cost together in a calendar month.
 RUNPOD_SCIENTIFIC_MAX_JOB_USD = env("RUNPOD_SCIENTIFIC_MAX_JOB_USD", default="5")
 RUNPOD_SCIENTIFIC_MONTHLY_USD = env("RUNPOD_SCIENTIFIC_MONTHLY_USD", default="50")
-RUNPOD_PODS_API_BASE = env("RUNPOD_PODS_API_BASE", default="https://rest.runpod.io/v1")
+# A scientific job placed on a Pod of its own: the GPU, cloud, disk and the
+# hourly price that bounds its estimate.
+RUNPOD_SCIENTIFIC_POD_GPU_TYPE = env(
+    "RUNPOD_SCIENTIFIC_POD_GPU_TYPE", default="NVIDIA GeForce RTX 4090"
+)
+RUNPOD_SCIENTIFIC_POD_CLOUD_TYPE = env("RUNPOD_SCIENTIFIC_POD_CLOUD_TYPE", default="SECURE")
+RUNPOD_SCIENTIFIC_POD_DISK_GB = env.int("RUNPOD_SCIENTIFIC_POD_DISK_GB", default=40)
+RUNPOD_SCIENTIFIC_POD_PRICE_PER_HOUR_USD = env(
+    "RUNPOD_SCIENTIFIC_POD_PRICE_PER_HOUR_USD", default="0"
+)
+RUNPOD_PODS_API_BASE = env("RUNPOD_PODS_API_BASE", default="https://api.runpod.io/v2")
 RL_RUNPOD_IMAGE_DIGEST = env("RL_RUNPOD_IMAGE_DIGEST", default="")
 RL_RUNPOD_GPU_TYPE = env("RL_RUNPOD_GPU_TYPE", default="NVIDIA GeForce RTX 4090")
 RL_RUNPOD_CLOUD_TYPE = env("RL_RUNPOD_CLOUD_TYPE", default="SECURE")

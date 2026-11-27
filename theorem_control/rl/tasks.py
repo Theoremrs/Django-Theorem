@@ -178,14 +178,11 @@ def _training_payload(run: TrainingRun, store: ArtifactStore) -> dict[str, Any]:
     }
     return {
         "name": f"theorem-rl-{str(run.id)[:12]}",
-        "imageName": run.image_digest,
-        "cloudType": settings.RL_RUNPOD_CLOUD_TYPE,
-        "computeType": "GPU",
-        "gpuTypeIds": [settings.RL_RUNPOD_GPU_TYPE],
-        "gpuCount": 1,
-        "containerDiskInGb": 50,
-        "volumeInGb": 20,
-        "volumeMountPath": "/workspace",
+        "image": run.image_digest,
+        "cloud": settings.RL_RUNPOD_CLOUD_TYPE,
+        "gpu": {"id": settings.RL_RUNPOD_GPU_TYPE, "count": 1},
+        "disk": 50,
+        "mounts": {"persistent": {"size": 20, "path": "/workspace"}},
         "env": {
             "THEOREM_RL_RUN_ID": str(run.id),
             "THEOREM_TASKSET_REF": run.taskset_ref,
@@ -262,7 +259,7 @@ def run_prime_rl_training(run_id: str) -> dict[str, Any]:
                 status=TrainingRun.Status.CANCELED,
             ).exists(),
         )
-        if str(state.get("desiredStatus") or "").upper() == "CANCELED":
+        if str(state.get("status") or "").upper() == "CANCELED":
             return _finish(run, TrainingRun.Status.CANCELED)
         traces, supporting = _read_training_outputs(run, store)
         ingest_trajectories(run, traces, store=store)

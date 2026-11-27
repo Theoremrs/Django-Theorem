@@ -10,6 +10,7 @@ before the job is reported as succeeded.
 
 from __future__ import annotations
 
+import json
 import re
 from decimal import Decimal, InvalidOperation
 from typing import Any, Literal
@@ -34,6 +35,10 @@ OUTPUT_EXTENSION = "tar.gz"
 # The worker's runner shares the job's deadline; RunPod's own execution timeout
 # is a backstop past it that leaves room to fetch the bundle and upload results.
 TRANSFER_GRACE_SECONDS = 120
+# A Pod is billed from creation, while its image is pulled and it boots.
+POD_START_GRACE_SECONDS = 600
+POD_RESULT_EXTENSION = "result.json"
+POD_COMMAND = ["/opt/worker/venv/bin/python", "-u", "/opt/worker/worker.py", "--pod"]
 _ERROR_CODE = re.compile(r"^([a-z][a-z0-9_]{2,63}): ")
 
 
@@ -52,6 +57,8 @@ class Resources(BaseModel):
     cpu: int | None = Field(default=None, gt=0)
     memory_mb: int | None = Field(default=None, gt=0)
     timeout_seconds: int = Field(gt=0, le=7 * 24 * 60 * 60)
+    # Where on RunPod: the queue-based Serverless endpoint, or a Pod of its own.
+    placement: Literal["serverless", "pod"] | None = None
 
 
 class Budget(BaseModel):
@@ -114,7 +121,31 @@ def price_per_second() -> Decimal:
     return price
 
 
+def placement(resources: dict[str, Any] | Resources) -> str:
+    """The job's own choice, else the Serverless endpoint when one is configured."""
+    chosen = resources.get("placement") if isinstance(resources, dict) else resources.placement
+    if chosen:
+        return str(chosen)
+    return "serverless" if settings.RUNPOD_SCIENTIFIC_ENDPOINT_ID else "pod"
+
+
+def job_placement(job) -> str:
+    return placement(((job.kwargs_json.get("params") or {}).get("resources")) or {})
+
+
+def pod_price_per_second() -> Decimal:
+    hourly = _usd_setting("RUNPOD_SCIENTIFIC_POD_PRICE_PER_HOUR_USD")
+    if hourly == 0 and settings.OFFLOAD_EXECUTION_MODE == "runpod":
+        raise PricingUnavailable(
+            "RUNPOD_SCIENTIFIC_POD_PRICE_PER_HOUR_USD is required for scientific jobs on a Pod"
+        )
+    return hourly / 3600
+
+
 def estimate_usd(params: ScientificParams) -> Decimal:
+    if placement(params.resources) == "pod":
+        seconds = params.resources.timeout_seconds + POD_START_GRACE_SECONDS + TRANSFER_GRACE_SECONDS
+        return (pod_price_per_second() * seconds).quantize(Decimal("0.000001"))
     return price_per_second() * params.resources.timeout_seconds
 
 
@@ -196,7 +227,9 @@ def enforce_budget(tenant_id: UUID, estimate: Decimal, params: ScientificParams)
         )
 
 
-def runpod_input(job, *, store: ArtifactStore, output_artifact_key: str) -> dict[str, Any]:
+def runpod_input(
+    job, *, store: ArtifactStore, output_artifact_key: str, price: Decimal | None = None
+) -> dict[str, Any]:
     """The byte-free request the scientific worker accepts."""
     if job.tenant_id is None:
         raise ArtifactValidationError("RunPod jobs require an admitted tenant")
@@ -221,9 +254,48 @@ def runpod_input(job, *, store: ArtifactStore, output_artifact_key: str) -> dict
             ),
         },
         "params": job.kwargs_json.get("params") or {},
-        "price_per_second_usd": str(price_per_second()),
+        "price_per_second_usd": str(price_per_second() if price is None else price),
         "max_bytes": store.max_bytes,
     }
+
+
+def pod_request(
+    job, *, store: ArtifactStore, output_artifact_key: str, result_artifact_key: str
+) -> dict[str, Any]:
+    """A Pod of its own for one job: the worker's request rides in its
+    environment, with a presigned PUT for the handler's result."""
+    request = runpod_input(
+        job, store=store, output_artifact_key=output_artifact_key, price=pod_price_per_second()
+    )
+    request["result_url"] = store.presign_put_content(
+        job.tenant_id, result_artifact_key, content_type="application/json"
+    )
+    return {
+        "name": f"theorem-scientific-{str(job.id)[:12]}",
+        "image": settings.RUNPOD_SCIENTIFIC_IMAGE_DIGEST,
+        "cloud": settings.RUNPOD_SCIENTIFIC_POD_CLOUD_TYPE,
+        # torch's CUDA 13 wheels need a driver that supports CUDA 13.
+        "gpu": {"id": settings.RUNPOD_SCIENTIFIC_POD_GPU_TYPE, "count": 1, "minCudaVersion": "13.0"},
+        "disk": settings.RUNPOD_SCIENTIFIC_POD_DISK_GB,
+        "cmd": POD_COMMAND,
+        "env": {"THEOREM_SCIENTIFIC_REQUEST": json.dumps(request, sort_keys=True)},
+    }
+
+
+def pod_deadline_seconds(job) -> int:
+    """How long a Pod may live: the job's own time plus boot and transfers."""
+    return timeout_seconds(job) + POD_START_GRACE_SECONDS + TRANSFER_GRACE_SECONDS
+
+
+def pod_cost(state: dict[str, Any], seconds: float) -> Decimal:
+    """The Pod's hourly rate as RunPod reports it (``cost``), else the configured
+    one, for the time from creation to termination."""
+    raw = state.get("cost")
+    if isinstance(raw, (int, float)) and not isinstance(raw, bool) and raw > 0:
+        per_second = Decimal(str(raw)) / 3600
+    else:
+        per_second = pod_price_per_second()
+    return (per_second * Decimal(str(max(seconds, 0)))).quantize(Decimal("0.000001"))
 
 
 def timeout_seconds(job) -> int:

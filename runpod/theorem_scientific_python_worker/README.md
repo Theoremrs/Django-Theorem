@@ -1,6 +1,7 @@
 # Theorem Scientific Python Worker
 
-The RunPod Serverless worker behind `scientific_python.run`. It runs one Theorem
+The RunPod worker behind `scientific_python.run`, on Serverless or on a Pod of
+its own. It runs one Theorem
 computation (a job directory Theorem uploaded as a gzip tarball) in Theorem's
 standard scientific environment with the `accelerated` and `cuda` extras, using
 Theorem's own runner, and uploads a result tarball holding `result.json`,
@@ -83,6 +84,20 @@ which creates no Fly Machine. Then:
 2. Set on the Django control plane `RUNPOD_SCIENTIFIC_ENDPOINT_ID`,
    `RUNPOD_SCIENTIFIC_IMAGE_DIGEST` (the immutable image reference) and
    `RUNPOD_SCIENTIFIC_PRICE_PER_SECOND_USD` (the endpoint GPU class's price).
+
+A job whose `resources.placement` is `pod`, or any job when no Serverless
+endpoint is configured, runs on a Pod of its own instead: Django creates it
+through RunPod's REST API v2 on this same image with `worker.py --pod`, passes
+the request in `THEOREM_SCIENTIFIC_REQUEST` with a presigned PUT for the
+handler's result, terminates the Pod once that result is read (or at the job's
+timeout plus boot and transfer time), and meters the Pod's own hourly `cost`
+for the time it lived. Set `RUNPOD_SCIENTIFIC_POD_GPU_TYPE`,
+`RUNPOD_SCIENTIFIC_POD_CLOUD_TYPE` and `RUNPOD_SCIENTIFIC_POD_PRICE_PER_HOUR_USD`
+(an upper bound for that GPU, which prices the estimate).
+
+Either way a job's estimate must fit `RUNPOD_SCIENTIFIC_MAX_JOB_USD` (default
+$5) and what is left of `RUNPOD_SCIENTIFIC_MONTHLY_USD` (default $50), which
+every tenant's scientific jobs share in a calendar month.
 
 To check a request without RunPod, run
 `python worker.py --local-input request.json`.

@@ -1,4 +1,4 @@
-"""RunPod Pod REST client for long-running prime-rl training."""
+"""RunPod Pod client (REST API v2) for prime-rl training and scientific jobs."""
 
 from __future__ import annotations
 
@@ -26,19 +26,19 @@ class RunpodPodTimeoutError(RuntimeError):
 @dataclass(frozen=True)
 class CreatedPod:
     pod_id: str
-    desired_status: str
+    status: str
 
 
 class RunpodPodClient:
-    """Small client for the current ``https://rest.runpod.io/v1/pods`` API."""
+    """Small client for ``https://api.runpod.io/v2/pods``; REST v1 is retired."""
 
-    TERMINAL_STATUSES = frozenset({"EXITED", "TERMINATED", "FAILED"})
+    TERMINAL_STATUSES = frozenset({"EXITED", "ERROR", "TERMINATED"})
 
     def __init__(
         self,
         *,
         api_key: str,
-        base_url: str = "https://rest.runpod.io/v1",
+        base_url: str = "https://api.runpod.io/v2",
         timeout_seconds: float = 30.0,
         client: httpx.Client | None = None,
     ) -> None:
@@ -86,10 +86,10 @@ class RunpodPodClient:
     def create(self, payload: Mapping[str, Any]) -> CreatedPod:
         response = self._request("POST", "pods", json=dict(payload))
         pod_id = str(response.get("id") or "").strip()
-        desired_status = str(response.get("desiredStatus") or "").strip().upper()
+        status = str(response.get("status") or "").strip().upper()
         if not pod_id:
             raise RunpodPodApiError("RunPod create response did not include id")
-        return CreatedPod(pod_id=pod_id, desired_status=desired_status)
+        return CreatedPod(pod_id=pod_id, status=status)
 
     def get(self, pod_id: str) -> dict[str, Any]:
         return self._request("GET", f"pods/{quote(pod_id, safe='')}")
@@ -111,11 +111,11 @@ class RunpodPodClient:
         while True:
             if canceled is not None and canceled():
                 self.terminate(pod_id)
-                return {"id": pod_id, "desiredStatus": "CANCELED"}
+                return {"id": pod_id, "status": "CANCELED"}
             state = self.get(pod_id)
             if on_update is not None:
                 on_update(state)
-            status = str(state.get("desiredStatus") or "").upper()
+            status = str(state.get("status") or "").upper()
             if status in self.TERMINAL_STATUSES:
                 return state
             if monotonic() >= deadline:

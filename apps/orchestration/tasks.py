@@ -16,6 +16,7 @@ import logging
 import math
 import os
 from collections.abc import Mapping
+from time import monotonic, sleep
 from typing import Any
 
 from celery import shared_task
@@ -27,6 +28,7 @@ from apps.orchestration import scientific
 from apps.orchestration.artifacts import (
     GZIP_CONTENT_TYPE,
     ArtifactConfigurationError,
+    ArtifactNotFoundError,
     ArtifactStore,
     ArtifactStorageError,
     ArtifactValidationError,
@@ -37,6 +39,12 @@ from apps.orchestration.runpod import (
     RunpodConfigurationError,
     RunpodServerlessClient,
     RunpodTimeoutError,
+)
+from theorem_control.rl.runpod import (
+    RunpodPodApiError,
+    RunpodPodClient,
+    RunpodPodConfigurationError,
+    RunpodPodTimeoutError,
 )
 
 logger = logging.getLogger(__name__)
@@ -392,6 +400,8 @@ def _run_runpod_offload(job_id: str) -> dict[str, str]:
         return {"status": "canceled"}
     remote_job_id: str | None = None
     is_scientific = job.operation == scientific.OPERATION
+    if is_scientific and scientific.job_placement(job) == "pod":
+        return _run_runpod_pod(job)
     try:
         if job.tenant_id is None:
             raise ArtifactValidationError("RunPod jobs require an admitted tenant")
@@ -507,6 +517,167 @@ def _run_runpod_offload(job_id: str) -> dict[str, str]:
 
     if is_scientific:
         _charge_remote_execution(job, client, remote_job_id, state=result)
+    return _complete_runpod(
+        job,
+        store,
+        output_artifact_key,
+        result,
+        is_scientific=is_scientific,
+        remote_id=submitted.job_id,
+        engine="runpod-serverless",
+        image_digest=image_digest,
+    )
+
+
+class _PodJobCanceled(Exception):
+    """The job was canceled while its Pod ran."""
+
+
+def _await_pod_result(
+    job, client: RunpodPodClient, store: ArtifactStore, pod_id: str, result_key: str, seen: dict
+) -> dict[str, Any]:
+    """Poll for the worker's result until the Pod's deadline; ``seen`` keeps
+    the Pod's last state, whose hourly rate prices the job."""
+    from apps.orchestration.models import Job
+
+    deadline = monotonic() + scientific.pod_deadline_seconds(job)
+    last_status = ""
+    while True:
+        job.refresh_from_db(fields=["status"])
+        if job.status == Job.Status.CANCELED:
+            raise _PodJobCanceled
+        try:
+            reported = store.get_bytes(job.tenant_id, result_key)
+        except ArtifactNotFoundError:
+            reported = None
+        if reported is not None:
+            result = json.loads(reported)
+            if not isinstance(result, dict):
+                raise ValueError("the Pod's worker result must be an object")
+            return result
+        state = client.get(pod_id)
+        seen.update(state)
+        status = str(state.get("status") or "").upper()
+        if status != last_status:
+            _append_log(job, f"[RunPod] Pod {pod_id}: {status}")
+            job.save(update_fields=["logs", "updated_at"])
+            last_status = status
+        if status in RunpodPodClient.TERMINAL_STATUSES:
+            raise RunpodPodApiError(f"RunPod Pod {pod_id} ended as {status} before its worker reported")
+        if monotonic() >= deadline:
+            raise RunpodPodTimeoutError(
+                f"RunPod Pod {pod_id} did not report within {scientific.pod_deadline_seconds(job)}s"
+            )
+        sleep(max(settings.RUNPOD_POLL_INTERVAL_SECONDS, 0.1))
+
+
+def _end_pod(job, client: RunpodPodClient, pod_id: str, seen: dict, began: float) -> None:
+    """Terminate the Pod, which stops its billing, and meter the time it lived."""
+    for attempt in range(3):
+        try:
+            client.terminate(pod_id)
+            break
+        except RunpodPodApiError as exc:
+            _append_log(job, f"[RunPod] terminating Pod {pod_id} failed (attempt {attempt + 1}): {exc}")
+            job.save(update_fields=["logs", "updated_at"])
+    scientific.charge(job, scientific.pod_cost(seen, monotonic() - began))
+
+
+def _run_runpod_pod(job) -> dict[str, str]:
+    """A scientific job on a Pod of its own: create it, wait for the worker's
+    result, terminate it, meter its time, then verify the result tarball."""
+    job_id = str(job.id)
+    pod_id: str | None = None
+    client: RunpodPodClient | None = None
+    seen: dict[str, Any] = {}
+    began = monotonic()
+    try:
+        if job.tenant_id is None:
+            raise ArtifactValidationError("RunPod jobs require an admitted tenant")
+        image_digest = settings.RUNPOD_SCIENTIFIC_IMAGE_DIGEST
+        if not image_digest:
+            raise RunpodPodConfigurationError("RUNPOD_SCIENTIFIC_IMAGE_DIGEST is required for provenance")
+        store = ArtifactStore.from_settings()
+        output_artifact_key = store.output_key(
+            job.tenant_id, job.operation_id, extension=scientific.OUTPUT_EXTENSION
+        )
+        result_key = store.output_key(
+            job.tenant_id, job.operation_id, extension=scientific.POD_RESULT_EXTENSION
+        )
+        client = RunpodPodClient(
+            api_key=settings.RUNPOD_API_KEY,
+            base_url=settings.RUNPOD_PODS_API_BASE,
+            timeout_seconds=settings.RUNPOD_REQUEST_TIMEOUT_SECONDS,
+        )
+        request = scientific.pod_request(
+            job, store=store, output_artifact_key=output_artifact_key, result_artifact_key=result_key
+        )
+        began = monotonic()
+        pod = client.create(request)
+        pod_id = pod.pod_id
+        metadata = dict(job.kwargs_json)
+        metadata["output_artifact_key"] = output_artifact_key
+        metadata["runpod"] = {"placement": "pod", "pod_id": pod_id}
+        job.kwargs_json = metadata
+        _append_log(job, f"[RunPod] created Pod {pod_id}: {pod.status}")
+        job.save(update_fields=["kwargs_json", "logs", "updated_at"])
+        envelope = _await_pod_result(job, client, store, pod_id, result_key, seen)
+    except _PodJobCanceled:
+        return {"status": "canceled"}
+    except (
+        ArtifactConfigurationError,
+        ArtifactStorageError,
+        ArtifactValidationError,
+        RunpodPodApiError,
+        RunpodPodConfigurationError,
+        RunpodPodTimeoutError,
+        scientific.PricingUnavailable,
+        ValueError,
+    ) as exc:
+        return _fail_job(job_id, str(exc), log_prefix="RunPod")
+    finally:
+        if client is not None and pod_id is not None:
+            _end_pod(job, client, pod_id, seen, began)
+    try:
+        store.delete_artifact(job.tenant_id, result_key)
+    except ArtifactStorageError as exc:
+        _append_log(job, f"[RunPod] the Pod's result report was not removed: {exc}")
+    if envelope.get("error"):
+        failure = _handler_failure(envelope["error"], envelope)
+        return _fail_job(
+            job_id,
+            str(envelope["error"]),
+            log_prefix="RunPod",
+            error_code=failure.code,
+            remote_logs=failure.logs,
+        )
+    return _complete_runpod(
+        job,
+        store,
+        output_artifact_key,
+        {"status": RunpodServerlessClient.SUCCESS, "output": envelope},
+        is_scientific=True,
+        remote_id=pod_id,
+        engine="runpod-pod",
+        image_digest=image_digest,
+    )
+
+
+def _complete_runpod(
+    job,
+    store: ArtifactStore,
+    output_artifact_key: str,
+    result: Mapping[str, Any],
+    *,
+    is_scientific: bool,
+    remote_id: str,
+    engine: str,
+    image_digest: str,
+) -> dict[str, str]:
+    """Verify what the worker reported and record the job as succeeded."""
+    from apps.orchestration.models import Job
+
+    job_id = str(job.id)
     if result["status"] != RunpodServerlessClient.SUCCESS:
         message = str(result.get("error") or f"RunPod job finished as {result['status']}")
         # A handler's returned error fails the RunPod job; its other fields stay in output.
@@ -562,18 +733,18 @@ def _run_runpod_offload(job_id: str) -> dict[str, str]:
         job.output_rows = verified_output.rows
     job.status = Job.Status.SUCCEEDED
     job.ended_at = dj_timezone.now()
-    _append_log(job, f"[RunPod] completed {submitted.job_id}")
+    _append_log(job, f"[RunPod] completed {remote_id}")
     job.save()
     _post_provenance(
         job,
-        engine="runpod-serverless",
+        engine=engine,
         agent_name="theorem-control-plane",
         code_ref=image_digest,
     )
     return {
         "status": "succeeded",
         "output_payload_digest": payload_digest,
-        "runpod_job_id": submitted.job_id,
+        "runpod_job_id": remote_id,
     }
 
 

@@ -94,7 +94,7 @@ preflight as the Fly R worker before starting Celery.
 | `RUNPOD_SCIENTIFIC_IMAGE_DIGEST` | Immutable scientific Python worker image digest stamped on its provenance |
 | `RUNPOD_SCIENTIFIC_PRICE_PER_SECOND_USD` | RunPod price per second of the scientific endpoint's GPU class; budgets and cost use it |
 | `RUNPOD_JOB_TIMEOUT_SECONDS` | Control-plane deadline; timeout cancels the RunPod job |
-| `RUNPOD_PODS_API_BASE` | RunPod Pods REST base URL; defaults to `https://rest.runpod.io/v1` |
+| `RUNPOD_PODS_API_BASE` | RunPod Pods REST base URL; defaults to `https://api.runpod.io/v2` (REST v1 is retired) |
 | `RL_RUNPOD_IMAGE_DIGEST` | Immutable default Prime-RL Pod image reference |
 | `RL_RUNPOD_GPU_TYPE` / `RL_RUNPOD_CLOUD_TYPE` | Pod GPU type and placement |
 | `RL_RUNPOD_POLL_INTERVAL_SECONDS` | Pod status polling interval |

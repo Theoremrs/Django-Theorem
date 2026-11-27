@@ -65,6 +65,9 @@ class MemoryS3:
     def put_object(self, *, Bucket, Key, Body, ContentType):
         self.objects[Key] = Body
 
+    def delete_object(self, *, Bucket, Key):
+        self.objects.pop(Key, None)
+
     def get_object(self, *, Bucket, Key):
         if Key not in self.objects:
             raise ClientError({"Error": {"Code": "NoSuchKey"}}, "GetObject")
@@ -649,3 +652,188 @@ def test_runpod_task_cancels_the_remote_job_when_cancelled_while_polling(client,
     assert job.status == Job.Status.CANCELED
     assert runpod.instances[0].cancelled == ["rp-remote-1"]
     assert job.cost_usd == Decimal("0.001000")  # 2.5 s of execution before the cancel
+
+
+POD = RUNPOD | {"RUNPOD_SCIENTIFIC_POD_PRICE_PER_HOUR_USD": "0.72"}
+POD_RESOURCES = {"gpu": "cuda", "timeout_seconds": 600, "placement": "pod"}
+
+
+class FakePods:
+    """Plays RunPod's Pod API and the worker inside the Pod."""
+
+    TERMINAL_STATUSES = frozenset({"EXITED", "ERROR", "TERMINATED"})
+    instances: list["FakePods"] = []
+    report = None  # (fake, request) -> worker result dict, or None to exit unreported
+
+    def __init__(self, **kwargs):
+        self.created = None
+        self.terminated: list[str] = []
+        self.polls = 0
+        FakePods.instances.append(self)
+
+    def create(self, payload):
+        self.created = payload
+        return type("Created", (), {"pod_id": "pod-1", "status": "PROVISIONING"})()
+
+    def get(self, pod_id):
+        self.polls += 1
+        request = json.loads(self.created["env"]["THEOREM_SCIENTIFIC_REQUEST"])
+        result = FakePods.report(self, request)
+        if result is None:
+            return {"id": pod_id, "status": "EXITED", "cost": 0.69}
+        FakePods.s3.objects[_result_key(request)] = json.dumps(result).encode()
+        return {"id": pod_id, "status": "RUNNING", "cost": 0.69}
+
+    def terminate(self, pod_id):
+        self.terminated.append(pod_id)
+
+
+def _result_key(request) -> str:
+    return request["output"]["artifact_key"].removesuffix(".tar.gz") + ".result.json"
+
+
+@pytest.fixture
+def pods(monkeypatch, s3):
+    FakePods.instances = []
+    FakePods.s3 = s3
+    monkeypatch.setattr("apps.orchestration.tasks.RunpodPodClient", FakePods)
+    return FakePods
+
+
+@pytest.mark.django_db
+@override_settings(**POD)
+def test_a_pod_estimate_covers_its_boot_and_transfers(client, s3, queued):
+    s3.objects[_content_key(client.tenant)] = BUNDLE
+
+    response = _post(client, "/internal/offload/invoke", _invoke_body(client.tenant, resources=POD_RESOURCES))
+
+    assert response.status_code == 200, response.content
+    job = Job.objects.get(id=response.json()["job_id"])
+    # (600 s + 600 s boot + 120 s transfers) x $0.72 an hour
+    assert job.estimated_cost_usd == Decimal("0.264000")
+
+
+@pytest.mark.django_db
+@override_settings(**(RUNPOD | {"RUNPOD_SCIENTIFIC_ENDPOINT_ID": ""}))
+def test_a_pod_needs_its_hourly_price(client, s3, queued):
+    s3.objects[_content_key(client.tenant)] = BUNDLE
+
+    response = _post(client, "/internal/offload/invoke", _invoke_body(client.tenant))
+
+    assert response.status_code == 503
+    assert "RUNPOD_SCIENTIFIC_POD_PRICE_PER_HOUR_USD" in response.json()["detail"]
+
+
+@pytest.mark.django_db
+@override_settings(**POD)
+def test_a_pod_runs_the_bundle_then_is_terminated_and_metered(client, s3, pods, provenance):
+    s3.objects[_content_key(client.tenant)] = BUNDLE
+    result_tarball = b"\x1f\x8b pod result tarball"
+
+    def report(fake, request):
+        assert worker.validate_request(request) is None
+        assert request["price_per_second_usd"] == str(Decimal("0.72") / 3600)
+        s3.objects[request["output"]["artifact_key"]] = result_tarball
+        return {
+            "output": {
+                "artifact_key": request["output"]["artifact_key"],
+                "payload_digest": "sha256:" + hashlib.sha256(result_tarball).hexdigest(),
+                "bytes": len(result_tarball),
+            },
+            "worker": {"executor": "runpod-pod", "runpod_job_id": "pod-1"},
+            "logs": "[stdout] simulated",
+        }
+
+    pods.report = report
+    job = _running_job(client.tenant, resources=POD_RESOURCES)
+
+    outcome = run_offload_python(str(job.id))
+
+    job.refresh_from_db()
+    fake = pods.instances[0]
+    assert outcome["status"] == "succeeded", job.error
+    assert fake.created["image"] == "ghcr.io/theorem/scientific@sha256:immutable"
+    assert fake.created["cmd"][-1] == "--pod"
+    assert fake.created["gpu"] == {"id": "NVIDIA GeForce RTX 4090", "count": 1, "minCudaVersion": "13.0"}
+    assert fake.terminated == ["pod-1"]
+    assert job.status == Job.Status.SUCCEEDED
+    assert job.output_payload_digest == "sha256:" + hashlib.sha256(result_tarball).hexdigest()
+    assert job.kwargs_json["runpod"] == {"placement": "pod", "pod_id": "pod-1"}
+    assert job.kwargs_json["worker"]["executor"] == "runpod-pod"
+    assert job.cost_usd is not None and Decimal(0) <= job.cost_usd < Decimal("0.01")
+    assert not any(key.endswith(".result.json") for key in s3.objects)
+    assert provenance[0]["activity"]["code_ref"] == "ghcr.io/theorem/scientific@sha256:immutable"
+
+
+@pytest.mark.django_db
+@override_settings(**POD)
+def test_a_pod_that_exits_without_reporting_fails_and_is_terminated(client, s3, pods):
+    s3.objects[_content_key(client.tenant)] = BUNDLE
+    pods.report = lambda fake, request: None
+    job = _running_job(client.tenant, resources=POD_RESOURCES)
+
+    assert run_offload_python(str(job.id))["status"] == "failed"
+
+    job.refresh_from_db()
+    assert "ended as EXITED before its worker reported" in job.error
+    assert pods.instances[0].terminated == ["pod-1"]
+    assert job.cost_usd is not None
+
+
+@pytest.mark.django_db
+@override_settings(**POD)
+def test_a_pod_workers_failure_keeps_its_code(client, s3, pods):
+    s3.objects[_content_key(client.tenant)] = BUNDLE
+    pods.report = lambda fake, request: {
+        "error": "timeout: the computation ran past resources.timeout_seconds=600",
+        "code": "timeout",
+        "logs": "[stdout] step 9",
+    }
+    job = _running_job(client.tenant, resources=POD_RESOURCES)
+
+    assert run_offload_python(str(job.id))["status"] == "failed"
+
+    job.refresh_from_db()
+    assert job.error_code == "timeout"
+    assert "[stdout] step 9" in job.logs
+    assert pods.instances[0].terminated == ["pod-1"]
+
+
+def test_pod_cost_uses_the_pods_own_rate_else_the_configured_one():
+    with override_settings(RUNPOD_SCIENTIFIC_POD_PRICE_PER_HOUR_USD="0.36"):
+        assert scientific.pod_cost({"cost": 0.72}, 3600) == Decimal("0.720000")
+        assert scientific.pod_cost({}, 1800) == Decimal("0.180000")
+
+
+def test_the_worker_on_a_pod_reports_once_then_waits(monkeypatch):
+    request = {"contract": "theorem.scientific_python.v1", "result_url": "https://storage.example/put"}
+    monkeypatch.setenv(worker.POD_REQUEST_ENV, json.dumps(request))
+    monkeypatch.setenv("RUNPOD_POD_ID", "pod-7")
+    handled: list[dict] = []
+    monkeypatch.setattr(worker, "handler", lambda job: handled.append(job) or {"output": {"bytes": 1}})
+    sent: list = []
+
+    class Response:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc):
+            return False
+
+    monkeypatch.setattr(worker, "urlopen", lambda put, timeout: sent.append(put) or Response())
+
+    class Waiting(Exception):
+        pass
+
+    def pause():
+        raise Waiting
+
+    monkeypatch.setattr(worker.signal, "pause", pause)
+
+    with pytest.raises(Waiting):
+        worker.run_pod()
+
+    assert handled == [{"id": "pod-7", "executor": "runpod-pod", "input": {"contract": "theorem.scientific_python.v1"}}]
+    assert sent[0].full_url == "https://storage.example/put"
+    assert json.loads(sent[0].data) == {"output": {"bytes": 1}}
+    assert worker.POD_REQUEST_ENV not in __import__("os").environ
