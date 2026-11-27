@@ -73,7 +73,7 @@ class ScientificParams(BaseModel):
     budget: Budget = Budget()
     entry: str | None = None
     seed: int | None = None
-    network: bool = False
+    network: bool = True
 
 
 def parse_params(raw: dict[str, Any]) -> ScientificParams:
@@ -130,6 +130,53 @@ def reserved_usd(tenant_id: UUID) -> Decimal:
     return total or Decimal(0)
 
 
+def _usd_setting(name: str) -> Decimal:
+    try:
+        value = Decimal(str(getattr(settings, name)).strip())
+    except InvalidOperation as exc:
+        raise PricingUnavailable(f"{name} is not a number") from exc
+    if not value.is_finite() or value < 0:
+        raise PricingUnavailable(f"{name} must be non-negative")
+    return value
+
+
+def month_spend_usd() -> Decimal:
+    """What scientific jobs cost on RunPod this calendar month, across every
+    tenant: metered jobs at their cost, queued and running ones at their
+    estimate."""
+    from apps.orchestration.models import Job
+
+    now = timezone.now()
+    month = Job.objects.filter(
+        operation=OPERATION,
+        created_at__gte=now.replace(day=1, hour=0, minute=0, second=0, microsecond=0),
+    )
+    spent = month.aggregate(total=Sum("cost_usd"))["total"] or Decimal(0)
+    reserved = month.filter(
+        status__in=(Job.Status.QUEUED, Job.Status.RUNNING),
+        cost_usd__isnull=True,
+        estimated_cost_usd__isnull=False,
+    ).aggregate(total=Sum("estimated_cost_usd"))["total"] or Decimal(0)
+    return spent + reserved
+
+
+def enforce_spend_limits(estimate: Decimal) -> None:
+    """The operator's RunPod limits: one job's estimate, and the month's spend."""
+    job_limit = _usd_setting("RUNPOD_SCIENTIFIC_MAX_JOB_USD")
+    if estimate > job_limit:
+        raise BudgetExceeded(
+            f"estimated cost ${estimate:.6f} exceeds the ${job_limit:.2f} limit for one "
+            "RunPod job; shorten resources.timeout_seconds"
+        )
+    month_limit = _usd_setting("RUNPOD_SCIENTIFIC_MONTHLY_USD")
+    remaining = month_limit - month_spend_usd()
+    if estimate > remaining:
+        raise BudgetExceeded(
+            f"estimated cost ${estimate:.6f} exceeds the ${max(remaining, Decimal(0)):.6f} "
+            f"left of this month's ${month_limit:.2f} RunPod limit"
+        )
+
+
 def enforce_budget(tenant_id: UUID, estimate: Decimal, params: ScientificParams) -> None:
     """Refuse before queueing; the caller holds the tenant row lock."""
     max_usd = params.budget.max_usd
@@ -137,6 +184,7 @@ def enforce_budget(tenant_id: UUID, estimate: Decimal, params: ScientificParams)
         raise BudgetExceeded(
             f"estimated cost ${estimate:.6f} exceeds budget.max_usd ${Decimal(str(max_usd)):.6f}"
         )
+    enforce_spend_limits(estimate)
     allowance = credit_allowance(tenant_id, timezone.now().date())
     if allowance.limit_usd is None:
         return

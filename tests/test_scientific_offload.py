@@ -328,6 +328,46 @@ def test_running_estimates_count_against_the_period_credit(client, s3, queued):
 
 
 @pytest.mark.django_db
+@override_settings(**(RUNPOD | {"RUNPOD_SCIENTIFIC_MAX_JOB_USD": "0.20"}))
+def test_invoke_refuses_a_job_over_the_runpod_job_limit(client, s3, queued):
+    s3.objects[_content_key(client.tenant)] = BUNDLE
+
+    # 600 s x $0.0004 = $0.24 > $0.20, though the job's own budget allows $1.
+    response = _post(client, "/internal/offload/invoke", _invoke_body(client.tenant))
+
+    assert response.status_code == 402
+    assert "$0.20 limit for one RunPod job" in response.json()["detail"]
+    assert not Job.objects.filter(tenant=client.tenant).exists()
+
+
+@pytest.mark.django_db
+@override_settings(**(RUNPOD | {"RUNPOD_SCIENTIFIC_MONTHLY_USD": "1.00"}))
+def test_every_tenants_month_counts_against_the_runpod_monthly_limit(client, s3, queued):
+    s3.objects[_content_key(client.tenant)] = BUNDLE
+    other = Tenant.objects.create(slug=f"other-{uuid.uuid4().hex[:8]}", display_name="Other")
+    for status, cost, estimate in (
+        (Job.Status.SUCCEEDED, Decimal("0.50"), Decimal("0.60")),
+        (Job.Status.RUNNING, None, Decimal("0.30")),
+        (Job.Status.FAILED, None, Decimal("5.00")),
+    ):
+        Job.objects.create(
+            tenant=other,
+            operation="scientific_python.run",
+            operation_id=f"cj_{uuid.uuid4().hex}",
+            status=status,
+            cost_usd=cost,
+            estimated_cost_usd=estimate,
+        )
+
+    # $0.50 spent and $0.30 reserved leave $0.20 for a $0.24 estimate; the
+    # failed job was never metered and holds nothing.
+    response = _post(client, "/internal/offload/invoke", _invoke_body(client.tenant))
+
+    assert response.status_code == 402
+    assert "$0.200000 left of this month's $1.00 RunPod limit" in response.json()["detail"]
+
+
+@pytest.mark.django_db
 @override_settings(**(RUNPOD | {"RUNPOD_SCIENTIFIC_PRICE_PER_SECOND_USD": ""}))
 def test_invoke_refuses_paid_execution_without_a_price(client, s3, queued):
     s3.objects[_content_key(client.tenant)] = BUNDLE

@@ -149,6 +149,10 @@ RUNPOD_SCIENTIFIC_IMAGE_DIGEST = env("RUNPOD_SCIENTIFIC_IMAGE_DIGEST", default="
 RUNPOD_SCIENTIFIC_PRICE_PER_SECOND_USD = env(
     "RUNPOD_SCIENTIFIC_PRICE_PER_SECOND_USD", default="0"
 )
+# The operator's RunPod limits for scientific jobs: one job's estimate, and
+# what every tenant's jobs cost together in a calendar month.
+RUNPOD_SCIENTIFIC_MAX_JOB_USD = env("RUNPOD_SCIENTIFIC_MAX_JOB_USD", default="5")
+RUNPOD_SCIENTIFIC_MONTHLY_USD = env("RUNPOD_SCIENTIFIC_MONTHLY_USD", default="50")
 RUNPOD_PODS_API_BASE = env("RUNPOD_PODS_API_BASE", default="https://rest.runpod.io/v1")
 RL_RUNPOD_IMAGE_DIGEST = env("RL_RUNPOD_IMAGE_DIGEST", default="")
 RL_RUNPOD_GPU_TYPE = env("RL_RUNPOD_GPU_TYPE", default="NVIDIA GeForce RTX 4090")
