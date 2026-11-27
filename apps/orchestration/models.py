@@ -41,6 +41,26 @@ class Job(models.Model):
     output_rows = models.IntegerField(null=True, blank=True)
     logs = models.TextField(blank=True, default="")
     error = models.TextField(blank=True, default="")
+    error_code = models.CharField(
+        max_length=64,
+        blank=True,
+        default="",
+        help_text="Machine-readable failure reason a worker reported, e.g. environment_mismatch",
+    )
+    estimated_cost_usd = models.DecimalField(
+        max_digits=14,
+        decimal_places=6,
+        null=True,
+        blank=True,
+        help_text="Upper bound charged against the budget at invoke time",
+    )
+    cost_usd = models.DecimalField(
+        max_digits=14,
+        decimal_places=6,
+        null=True,
+        blank=True,
+        help_text="Actual cost from the provider's reported execution time",
+    )
     kwargs_json = models.JSONField(default=dict, blank=True)
     started_at = models.DateTimeField(null=True, blank=True)
     ended_at = models.DateTimeField(null=True, blank=True)

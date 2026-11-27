@@ -140,7 +140,33 @@ RUNPOD_POLL_INTERVAL_SECONDS = env.float("RUNPOD_POLL_INTERVAL_SECONDS", default
 RUNPOD_WORKER_IMAGE_DIGEST = env("RUNPOD_WORKER_IMAGE_DIGEST", default="")
 RUNPOD_EXTRACTION_ENDPOINT_ID = env("RUNPOD_EXTRACTION_ENDPOINT_ID", default="")
 RUNPOD_EXTRACTION_IMAGE_DIGEST = env("RUNPOD_EXTRACTION_IMAGE_DIGEST", default="")
-RUNPOD_PODS_API_BASE = env("RUNPOD_PODS_API_BASE", default="https://rest.runpod.io/v1")
+# The scientific Python worker (runpod/theorem_scientific_python_worker) runs
+# Theorem computation bundles on its own GPU endpoint. Its price per second is
+# the endpoint GPU class's RunPod rate: budgets are refused against
+# timeout_seconds x price, and actual cost is RunPod's executionTime x price.
+RUNPOD_SCIENTIFIC_ENDPOINT_ID = env("RUNPOD_SCIENTIFIC_ENDPOINT_ID", default="")
+RUNPOD_SCIENTIFIC_IMAGE_DIGEST = env("RUNPOD_SCIENTIFIC_IMAGE_DIGEST", default="")
+RUNPOD_SCIENTIFIC_PRICE_PER_SECOND_USD = env(
+    "RUNPOD_SCIENTIFIC_PRICE_PER_SECOND_USD", default="0"
+)
+# The operator's RunPod limits for scientific jobs: one job's estimate, and
+# what every tenant's jobs cost together in a calendar month.
+RUNPOD_SCIENTIFIC_MAX_JOB_USD = env("RUNPOD_SCIENTIFIC_MAX_JOB_USD", default="5")
+RUNPOD_SCIENTIFIC_MONTHLY_USD = env("RUNPOD_SCIENTIFIC_MONTHLY_USD", default="50")
+# A scientific job placed on a Pod of its own: the GPU, cloud, disk and the
+# hourly price that bounds its estimate.
+RUNPOD_SCIENTIFIC_POD_GPU_TYPE = env(
+    "RUNPOD_SCIENTIFIC_POD_GPU_TYPE", default="NVIDIA GeForce RTX 4090"
+)
+RUNPOD_SCIENTIFIC_POD_CLOUD_TYPE = env("RUNPOD_SCIENTIFIC_POD_CLOUD_TYPE", default="SECURE")
+RUNPOD_SCIENTIFIC_POD_DISK_GB = env.int("RUNPOD_SCIENTIFIC_POD_DISK_GB", default=40)
+RUNPOD_SCIENTIFIC_POD_PRICE_PER_HOUR_USD = env(
+    "RUNPOD_SCIENTIFIC_POD_PRICE_PER_HOUR_USD", default="0"
+)
+# The RunPod container registry credential (its id) a Pod pulls a private
+# image with, such as one on registry.fly.io; empty for a public image.
+RUNPOD_SCIENTIFIC_POD_REGISTRY_AUTH_ID = env("RUNPOD_SCIENTIFIC_POD_REGISTRY_AUTH_ID", default="")
+RUNPOD_PODS_API_BASE = env("RUNPOD_PODS_API_BASE", default="https://api.runpod.io/v2")
 RL_RUNPOD_IMAGE_DIGEST = env("RL_RUNPOD_IMAGE_DIGEST", default="")
 RL_RUNPOD_GPU_TYPE = env("RL_RUNPOD_GPU_TYPE", default="NVIDIA GeForce RTX 4090")
 RL_RUNPOD_CLOUD_TYPE = env("RL_RUNPOD_CLOUD_TYPE", default="SECURE")

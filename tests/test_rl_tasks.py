@@ -65,24 +65,24 @@ def test_pod_client_creates_polls_and_terminates():
     def handler(request):
         requests.append((request.method, request.url.path))
         if request.method == "POST":
-            return httpx.Response(200, json={"id": "pod-1", "desiredStatus": "RUNNING"})
+            return httpx.Response(200, json={"id": "pod-1", "status": "RUNNING"})
         if request.method == "GET":
-            return httpx.Response(200, json={"id": "pod-1", "desiredStatus": "EXITED"})
+            return httpx.Response(200, json={"id": "pod-1", "status": "EXITED"})
         return httpx.Response(204)
 
     client = RunpodPodClient(
         api_key="secret",
         client=httpx.Client(transport=httpx.MockTransport(handler)),
     )
-    pod = client.create({"name": "training", "imageName": "image@sha256:abc"})
+    pod = client.create({"name": "training", "image": "image@sha256:abc"})
     state = client.wait(pod.pod_id, timeout_seconds=1, poll_interval_seconds=0.1)
     client.terminate(pod.pod_id)
 
-    assert state["desiredStatus"] == "EXITED"
+    assert state["status"] == "EXITED"
     assert requests == [
-        ("POST", "/v1/pods"),
-        ("GET", "/v1/pods/pod-1"),
-        ("DELETE", "/v1/pods/pod-1"),
+        ("POST", "/v2/pods"),
+        ("GET", "/v2/pods/pod-1"),
+        ("DELETE", "/v2/pods/pod-1"),
     ]
 
 
@@ -92,7 +92,7 @@ def test_pod_client_terminates_on_deadline(monkeypatch):
     def handler(request):
         requests.append((request.method, request.url.path))
         if request.method == "GET":
-            return httpx.Response(200, json={"id": "pod-1", "desiredStatus": "RUNNING"})
+            return httpx.Response(200, json={"id": "pod-1", "status": "RUNNING"})
         return httpx.Response(204)
 
     ticks = iter([0.0, 1.0])
@@ -104,4 +104,18 @@ def test_pod_client_terminates_on_deadline(monkeypatch):
     )
     with pytest.raises(RunpodPodTimeoutError):
         client.wait("pod-1", timeout_seconds=0.5, poll_interval_seconds=0.1)
-    assert requests[-1] == ("DELETE", "/v1/pods/pod-1")
+    assert requests[-1] == ("DELETE", "/v2/pods/pod-1")
+
+
+def test_a_refused_pod_request_carries_runpods_reason():
+    import httpx
+    import pytest
+
+    from theorem_control.rl.runpod import RunpodPodApiError, RunpodPodClient
+
+    def refuse(request):
+        return httpx.Response(422, json={"status": 422, "detail": "gpu.id is not a known GPU type"})
+
+    client = RunpodPodClient(api_key="k", client=httpx.Client(transport=httpx.MockTransport(refuse)))
+    with pytest.raises(RunpodPodApiError, match="422 .*gpu.id is not a known GPU type"):
+        client.create({"name": "n", "image": "i"})

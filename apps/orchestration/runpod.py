@@ -95,8 +95,17 @@ class RunpodServerlessClient:
         with httpx.Client(timeout=self.timeout_seconds) as client:
             return send(client)
 
-    def submit(self, payload: Mapping[str, Any]) -> SubmittedRunpodJob:
-        response = self._request("POST", self._url("run"), json={"input": dict(payload)})
+    def submit(
+        self,
+        payload: Mapping[str, Any],
+        *,
+        policy: Mapping[str, Any] | None = None,
+    ) -> SubmittedRunpodJob:
+        """Queue a job; ``policy`` is RunPod's per-job execution policy, e.g. executionTimeout."""
+        body: dict[str, Any] = {"input": dict(payload)}
+        if policy:
+            body["policy"] = dict(policy)
+        response = self._request("POST", self._url("run"), json=body)
         job_id = str(response.get("id") or "").strip()
         status = str(response.get("status") or "").strip().upper()
         if not job_id or not status:

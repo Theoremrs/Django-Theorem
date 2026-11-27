@@ -90,8 +90,11 @@ preflight as the Fly R worker before starting Celery.
 | `RUNPOD_WORKER_IMAGE_DIGEST` | Immutable worker image digest stamped on RunPod provenance |
 | `RUNPOD_EXTRACTION_ENDPOINT_ID` | Dedicated queue endpoint for the pinned extraction worker image |
 | `RUNPOD_EXTRACTION_IMAGE_DIGEST` | Immutable extraction image digest stamped on extraction provenance |
+| `RUNPOD_SCIENTIFIC_ENDPOINT_ID` | Queue endpoint for the scientific Python worker (`scientific_python.run`) |
+| `RUNPOD_SCIENTIFIC_IMAGE_DIGEST` | Immutable scientific Python worker image digest stamped on its provenance |
+| `RUNPOD_SCIENTIFIC_PRICE_PER_SECOND_USD` | RunPod price per second of the scientific endpoint's GPU class; budgets and cost use it |
 | `RUNPOD_JOB_TIMEOUT_SECONDS` | Control-plane deadline; timeout cancels the RunPod job |
-| `RUNPOD_PODS_API_BASE` | RunPod Pods REST base URL; defaults to `https://rest.runpod.io/v1` |
+| `RUNPOD_PODS_API_BASE` | RunPod Pods REST base URL; defaults to `https://api.runpod.io/v2` (REST v1 is retired) |
 | `RL_RUNPOD_IMAGE_DIGEST` | Immutable default Prime-RL Pod image reference |
 | `RL_RUNPOD_GPU_TYPE` / `RL_RUNPOD_CLOUD_TYPE` | Pod GPU type and placement |
 | `RL_RUNPOD_POLL_INTERVAL_SECONDS` | Pod status polling interval |
@@ -147,6 +150,7 @@ Django sets `search_path=control,public`. Settings force
 - `POST /webhooks/workos` — verifies the WorkOS signature, then queues the account sync
 - `POST /internal/offload/invoke` — enqueue a tenant-bound Celery task
 - `POST /internal/offload/artifact-upload` — mint a tenant-scoped, short-lived Arrow upload URL
+- `POST /internal/offload/content-upload` — mint a tenant-scoped, content-addressed gzip upload URL
 - `GET /internal/offload/{job_id}` — return the caller tenant's job status + ArrowBatch descriptor
 - `POST /internal/offload/{job_id}/cancel` — cancel the caller tenant's job
 - `POST /internal/extraction/submit` — plan and fan out a tenant corpus extraction
@@ -206,11 +210,32 @@ never submit a `tenant_id`. Grant only the scopes required by the caller:
 | Route | Required scope |
 | --- | --- |
 | `POST /invoke` | `offload:invoke` |
+| `POST /content-upload` | `offload:invoke` |
 | `GET /{job_id}` | `offload:read` |
 | `POST /{job_id}/cancel` | `offload:cancel` |
 
 `offload:*` grants all three offload scopes. Revoked, expired, inactive-tenant,
 or unknown keys are refused; job lookups are filtered to the admitted tenant.
+
+### Scientific Python
+
+`scientific_python.run` runs one Theorem computation on the RunPod worker in
+`runpod/theorem_scientific_python_worker/`. Theorem uploads its job directory
+as a gzip tarball through `/content-upload` (the key is the bundle's sha256
+under the tenant prefix), then invokes with that key and `params` naming the
+Python, the `uv.lock` digest, extras, extra requirements, resources and an
+optional `budget.max_usd`.
+
+Before queueing, the control plane checks the bundle is uploaded with that
+digest and prices the job at `resources.timeout_seconds` times
+`RUNPOD_SCIENTIFIC_PRICE_PER_SECOND_USD`. An estimate over `budget.max_usd`,
+or over the period credit left after metered spend and the estimates of the
+tenant's running jobs, is refused with 402. RunPod's execution timeout holds
+the job to that time plus a transfer grace. When the job ends, its RunPod
+`executionTime` times the price is the job's `cost_usd`, metered into
+`credit_usd_micros`. The result tarball's digest is checked on readback before
+the job succeeds; worker failures carry an `error_code` such as
+`environment_mismatch`.
 
 ### Reinforcement-learning machine-key admission
 

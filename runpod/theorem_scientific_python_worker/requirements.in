@@ -1,0 +1,2 @@
+# The RunPod handler SDK only; the scientific environment is the vendored uv project.
+runpod==1.12.0
