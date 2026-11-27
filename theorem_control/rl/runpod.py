@@ -66,6 +66,12 @@ class RunpodPodClient:
             try:
                 response = client.request(method, url, headers=self._headers, **kwargs)
                 response.raise_for_status()
+            except httpx.HTTPStatusError as exc:
+                # RunPod's body says why (a 422 names the field it refused).
+                detail = exc.response.text.strip()[:500]
+                raise RunpodPodApiError(
+                    f"RunPod {method} {url} failed: {exc.response.status_code} {detail}"
+                ) from exc
             except httpx.HTTPError as exc:
                 raise RunpodPodApiError(f"RunPod {method} {url} failed: {exc}") from exc
             if response.status_code == 204 or not response.content:

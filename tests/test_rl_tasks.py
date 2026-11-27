@@ -105,3 +105,17 @@ def test_pod_client_terminates_on_deadline(monkeypatch):
     with pytest.raises(RunpodPodTimeoutError):
         client.wait("pod-1", timeout_seconds=0.5, poll_interval_seconds=0.1)
     assert requests[-1] == ("DELETE", "/v2/pods/pod-1")
+
+
+def test_a_refused_pod_request_carries_runpods_reason():
+    import httpx
+    import pytest
+
+    from theorem_control.rl.runpod import RunpodPodApiError, RunpodPodClient
+
+    def refuse(request):
+        return httpx.Response(422, json={"status": 422, "detail": "gpu.id is not a known GPU type"})
+
+    client = RunpodPodClient(api_key="k", client=httpx.Client(transport=httpx.MockTransport(refuse)))
+    with pytest.raises(RunpodPodApiError, match="422 .*gpu.id is not a known GPU type"):
+        client.create({"name": "n", "image": "i"})
